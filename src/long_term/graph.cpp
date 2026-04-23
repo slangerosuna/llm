@@ -95,7 +95,7 @@ void Graph::save_to_file(const std::string& filename) const {
         for (const auto& [index, sem_vec] : nodes) {
             write_pod(f, static_cast<uint64_t>(index));
             checked_write(f, sem_vec.data,
-                          sem_vec.dimensions * sizeof(std::float16_t));
+                          sem_vec.dimensions * sizeof(float16_t));
         }
 
         // Edge entries
@@ -105,7 +105,7 @@ void Graph::save_to_file(const std::string& filename) const {
                 write_pod(f, static_cast<uint64_t>(entry.to_index));
                 write_pod(f, entry.weight);
                 checked_write(f, entry.sem_vec.data,
-                              entry.sem_vec.dimensions * sizeof(std::float16_t));
+                              entry.sem_vec.dimensions * sizeof(float16_t));
             }
         }
     } catch (...) {
@@ -139,7 +139,7 @@ void Graph::load_impl(const std::string& filename, SpatialMap* spatial_map) {
         for (uint64_t ni = 0; ni < num_nodes; ++ni) {
             const uint64_t index = read_pod<uint64_t>(f);
             SemVec sv(node_dims);
-            checked_read(f, sv.data, node_dims * sizeof(std::float16_t));
+            checked_read(f, sv.data, node_dims * sizeof(float16_t));
             auto [it, inserted] = nodes.emplace(static_cast<size_t>(index), std::move(sv));
             if (spatial_map != nullptr) {
                 spatial_map->insert(it->first, &it->second);
@@ -151,7 +151,7 @@ void Graph::load_impl(const std::string& filename, SpatialMap* spatial_map) {
             const uint64_t to     = read_pod<uint64_t>(f);
             const float    weight = read_pod<float>(f);
             SemVec sv(edge_dims);
-            checked_read(f, sv.data, edge_dims * sizeof(std::float16_t));
+            checked_read(f, sv.data, edge_dims * sizeof(float16_t));
             edges[static_cast<size_t>(from)].emplace_back(
                 static_cast<size_t>(to), std::move(sv), weight);
         }

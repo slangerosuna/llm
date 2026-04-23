@@ -21,14 +21,7 @@ class Attention {
 	float prune_ratio_;
 
 	static float dot(const Vector& a, const Vector& b) {
-		if (a.size() != b.size()) {
-			throw std::runtime_error("Attention dot shape mismatch");
-		}
-		float s = 0.0f;
-		for (size_t i = 0; i < a.size(); ++i) {
-			s += a[i] * b[i];
-		}
-		return s;
+		return static_cast<float>(sycl_ops::dot(a, b));
 	}
 
 	static std::vector<float> softmax(const std::vector<float>& logits) {
@@ -79,11 +72,11 @@ public:
 			throw std::runtime_error("Attention K/V size mismatch");
 		}
 		if (all_k.empty()) {
-			return Matrix(query.size(), Vector(query.empty() ? 0 : query.front().size(), 0.0f));
+			return Matrix(query.size(), Vector(query.empty() ? 0 : query.front().size(), static_cast<Scalar>(0.0f)));
 		}
 
 		const float scale = 1.0f / std::sqrt(static_cast<float>(query.front().size()));
-		Matrix out(query.size(), Vector(all_v.front().size(), 0.0f));
+		Matrix out(query.size(), Vector(all_v.front().size(), static_cast<Scalar>(0.0f)));
 
 		for (size_t qi = 0; qi < query.size(); ++qi) {
 			std::vector<float> scores(all_k.size());
@@ -102,7 +95,8 @@ public:
 			for (size_t i = 0; i < kept.size(); ++i) {
 				const Vector& v = all_v[kept[i]];
 				for (size_t d = 0; d < v.size(); ++d) {
-					out[qi][d] += probs[i] * v[d];
+					const float acc = static_cast<float>(out[qi][d]) + probs[i] * static_cast<float>(v[d]);
+					out[qi][d] = static_cast<Scalar>(acc);
 				}
 			}
 		}
