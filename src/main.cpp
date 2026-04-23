@@ -12,6 +12,7 @@
 #include <boost/beast.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/json.hpp>
+#include <iostream>
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
@@ -226,7 +227,13 @@ net::ip::address get_host_from_env() {
   return address;
 }
 
+#include "training/encoder_decoder_demo.hpp"
+
 int main() {
+  auto result = llm::training::demo::run_minimal_encoder_decoder_sgd_overfit(1200, 0.05f, 42);
+  std::cout << "initial=" << result.initial_loss << " final=" << result.final_loss << "\n";
+  return (result.final_loss < result.initial_loss) ? 0 : 1;
+
   try {
     run_sycl_demo();
 

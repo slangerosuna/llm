@@ -1,3 +1,5 @@
+#pragma once
+
 #include "long_term/graph.hpp"
 #include "long_term/spatial_map.hpp"
 #include "long_term/sem_vec.hpp"
