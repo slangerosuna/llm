@@ -48,6 +48,7 @@ struct LoopConfig {
     size_t qk_dim      = 64;   // query/key dimension for RetNet and Attention
     size_t v_dim       = 64;   // value dimension (== semvec_dim for graph compat)
     size_t rel_dim     = 32;   // relation vector dimension (smaller edge label)
+    size_t hidden_layers = 0;  // extra v_dim -> v_dim hidden layers before heads
     float  decay       = 0.9f; // RetNet recurrent decay
     size_t max_steps   = 8;    // max inner iterations before forced output
 };
@@ -95,6 +96,9 @@ class LoopingRetNet {
     // Projects fused state back to model_dim for the next loop iteration.
     LinearProj loop_proj_; // v_dim → model_dim
 
+    // Optional hidden stack over fused state before heads.
+    std::vector<LinearProj> hidden_layers_;
+
     // 3-class action head.
     LinearProj action_head_; // v_dim → 3
 
@@ -105,7 +109,7 @@ class LoopingRetNet {
     Attention attention_;
 
     static constexpr uint32_t kModelMagic = 0x4C524E54; // "LRNT"
-    static constexpr uint32_t kModelVersion = 1;
+    static constexpr uint32_t kModelVersion = 2;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -250,6 +254,14 @@ class LoopingRetNet {
         return h;
     }
 
+    Vector apply_hidden_stack(const Vector& input) const {
+        Vector out = input;
+        for (const auto& layer : hidden_layers_) {
+            out = swiglu_self(layer.forward(out));
+        }
+        return out;
+    }
+
 public:
     explicit LoopingRetNet(const LoopConfig& cfg, uint32_t seed = 42)
         : cfg_(cfg), attention_(0.8f)
@@ -272,6 +284,11 @@ public:
         proj_r_     = LinearProj(cfg.model_dim, cfg.rel_dim,   s, rng);
         gate_r_     = LinearProj(cfg.model_dim, cfg.rel_dim,   s, rng);
         loop_proj_  = LinearProj(cfg.v_dim,     cfg.model_dim, s, rng);
+        hidden_layers_.clear();
+        hidden_layers_.reserve(cfg.hidden_layers);
+        for (size_t i = 0; i < cfg.hidden_layers; ++i) {
+            hidden_layers_.emplace_back(cfg.v_dim, cfg.v_dim, s, rng);
+        }
         action_head_= LinearProj(cfg.v_dim,     3,             s, rng);
         output_head_= LinearProj(cfg.v_dim,     cfg.char_vocab, s, rng);
         output_theta_ = static_cast<Scalar>(1.0f);
@@ -295,6 +312,7 @@ public:
         write_u64(os, static_cast<uint64_t>(cfg_.qk_dim));
         write_u64(os, static_cast<uint64_t>(cfg_.v_dim));
         write_u64(os, static_cast<uint64_t>(cfg_.rel_dim));
+        write_u64(os, static_cast<uint64_t>(cfg_.hidden_layers));
         os.write(reinterpret_cast<const char*>(&cfg_.decay), sizeof(cfg_.decay));
         write_u64(os, static_cast<uint64_t>(cfg_.max_steps));
 
@@ -312,6 +330,10 @@ public:
         write_linear(os, proj_r_);
         write_linear(os, gate_r_);
         write_linear(os, loop_proj_);
+        write_u64(os, static_cast<uint64_t>(hidden_layers_.size()));
+        for (const auto& layer : hidden_layers_) {
+            write_linear(os, layer);
+        }
         write_linear(os, action_head_);
         write_linear(os, output_head_);
         os.write(reinterpret_cast<const char*>(&output_theta_), sizeof(output_theta_));
@@ -332,7 +354,7 @@ public:
         if (magic != kModelMagic) {
             throw std::runtime_error("LoopingRetNet load: invalid file magic");
         }
-        if (version != kModelVersion) {
+        if (version != 1 && version != kModelVersion) {
             throw std::runtime_error("LoopingRetNet load: unsupported version");
         }
 
@@ -342,6 +364,9 @@ public:
         cfg.qk_dim = static_cast<size_t>(read_u64(is));
         cfg.v_dim = static_cast<size_t>(read_u64(is));
         cfg.rel_dim = static_cast<size_t>(read_u64(is));
+        cfg.hidden_layers = (version >= 2)
+            ? static_cast<size_t>(read_u64(is))
+            : 0;
         is.read(reinterpret_cast<char*>(&cfg.decay), sizeof(cfg.decay));
         cfg.max_steps = static_cast<size_t>(read_u64(is));
 
@@ -362,6 +387,18 @@ public:
         model.proj_r_ = read_linear(is);
         model.gate_r_ = read_linear(is);
         model.loop_proj_ = read_linear(is);
+        if (version >= 2) {
+            const size_t hidden_n = static_cast<size_t>(read_u64(is));
+            model.hidden_layers_.clear();
+            model.hidden_layers_.reserve(hidden_n);
+            for (size_t i = 0; i < hidden_n; ++i) {
+                model.hidden_layers_.push_back(read_linear(is));
+            }
+            model.cfg_.hidden_layers = hidden_n;
+        } else {
+            model.hidden_layers_.clear();
+            model.cfg_.hidden_layers = 0;
+        }
         model.action_head_ = read_linear(is);
         model.output_head_ = read_linear(is);
         is.read(reinterpret_cast<char*>(&model.output_theta_), sizeof(model.output_theta_));
@@ -380,6 +417,7 @@ public:
         h = fnv1a_u64(h, static_cast<uint64_t>(cfg_.qk_dim));
         h = fnv1a_u64(h, static_cast<uint64_t>(cfg_.v_dim));
         h = fnv1a_u64(h, static_cast<uint64_t>(cfg_.rel_dim));
+        h = fnv1a_u64(h, static_cast<uint64_t>(cfg_.hidden_layers));
         h = fnv1a_u64(h, static_cast<uint64_t>(cfg_.max_steps));
 
         for (const Vector& v : embed_table_) {
@@ -395,6 +433,9 @@ public:
         h = hash_linear(h, proj_r_);
         h = hash_linear(h, gate_r_);
         h = hash_linear(h, loop_proj_);
+        for (const auto& layer : hidden_layers_) {
+            h = hash_linear(h, layer);
+        }
         h = hash_linear(h, action_head_);
         h = hash_linear(h, output_head_);
         h = fnv1a_u64(h, static_cast<uint64_t>(static_cast<float>(output_theta_) * 1000000.0f));
@@ -417,6 +458,9 @@ public:
         total += proj_r_.w.size() + proj_r_.b.size();
         total += gate_r_.w.size() + gate_r_.b.size();
         total += loop_proj_.w.size() + loop_proj_.b.size();
+        for (const auto& l : hidden_layers_) {
+            total += l.w.size() + l.b.size();
+        }
         total += action_head_.w.size() + action_head_.b.size();
         total += output_head_.w.size() + output_head_.b.size();
         total += 1;
@@ -440,6 +484,9 @@ public:
         append_linear(proj_r_);
         append_linear(gate_r_);
         append_linear(loop_proj_);
+        for (const auto& l : hidden_layers_) {
+            append_linear(l);
+        }
         append_linear(action_head_);
         append_linear(output_head_);
         flat.push_back(output_theta_);
@@ -475,6 +522,9 @@ public:
         append_linear(proj_r_);
         append_linear(gate_r_);
         append_linear(loop_proj_);
+        for (auto& l : hidden_layers_) {
+            append_linear(l);
+        }
         append_linear(action_head_);
         append_linear(output_head_);
 
@@ -501,6 +551,9 @@ public:
         add_linear(proj_r_);
         add_linear(gate_r_);
         add_linear(loop_proj_);
+        for (const auto& l : hidden_layers_) {
+            add_linear(l);
+        }
         add_linear(action_head_);
         add_linear(output_head_);
         return total;
@@ -537,6 +590,9 @@ public:
         load_linear(proj_r_);
         load_linear(gate_r_);
         load_linear(loop_proj_);
+        for (auto& l : hidden_layers_) {
+            load_linear(l);
+        }
         load_linear(action_head_);
         load_linear(output_head_);
 
@@ -562,8 +618,11 @@ public:
         size_t inner_steps_taken;
         size_t query_count;
         Vector logits;
+        Vector raw_logits;
+        Vector final_state;
         std::vector<Vector> per_step_output_logits;
         std::vector<Vector> per_step_action_logits;
+        std::vector<Vector> per_step_states;
     };
 
     // Processes one input character token.
@@ -584,7 +643,8 @@ public:
         bool                      force_output = false,
         bool                      enable_query = true,
         size_t                    forced_loop_count = 0,
-        bool                      use_parallel_retention = false)
+        bool                      use_parallel_retention = false,
+        bool                      enable_memory_write = true)
     {
         // x starts as the character embedding and may be overridden to the
         // fused-state loop projection on subsequent inner steps.
@@ -596,6 +656,7 @@ public:
         Matrix v_hist;
         std::vector<Vector> all_output_logits;
         std::vector<Vector> all_action_logits;
+        std::vector<Vector> all_states;
 
         const size_t forced_loops = (forced_loop_count == 0)
             ? 0
@@ -642,11 +703,14 @@ public:
 
             // ── Fuse ─────────────────────────────────────────────────────
             Vector state = fuse(ret_out, attn_vec);
+            state = apply_hidden_stack(state);
 
             // ── Write current entry to graph and accumulate in kv_cache ──
-            bridge.write(current);
-            kv_cache.push_back(k, r, v, /*prune_score=*/0.0f);
-            kv_cache.prune_to_max(kv_cache_limit());
+            if (enable_memory_write) {
+                bridge.write(current);
+                kv_cache.push_back(k, r, v, /*prune_score=*/0.0f);
+                kv_cache.prune_to_max(kv_cache_limit());
+            }
 
             // ── Action decision ───────────────────────────────────────────
             const bool last_step = (step_i == cfg_.max_steps - 1);
@@ -657,9 +721,11 @@ public:
                 action = (step_i + 1 < forced_loops) ? ModelAction::LOOP : ModelAction::OUTPUT;
             }
 
-            const Vector logits = output_logits(state);
+            const Vector raw_logits = output_head_.forward(state);
+            const Vector logits = activation::param_tanh(raw_logits, output_theta_);
             all_output_logits.push_back(logits);
             all_action_logits.push_back(action_logits);
+            all_states.push_back(state);
 
             // Force output on the last step to guarantee termination.
             if (last_step) { action = ModelAction::OUTPUT; }
@@ -693,8 +759,11 @@ public:
             trace.inner_steps_taken = step_i + 1;
             trace.query_count = query_count;
             trace.logits = logits;
+            trace.raw_logits = raw_logits;
+            trace.final_state = state;
             trace.per_step_output_logits = std::move(all_output_logits);
             trace.per_step_action_logits = std::move(all_action_logits);
+            trace.per_step_states = std::move(all_states);
             return trace;
         }
 
@@ -718,6 +787,92 @@ public:
             false,
             true);
         return {t.output_char, t.inner_steps_taken};
+    }
+
+    size_t output_dim() const {
+        return output_head_.out_dim;
+    }
+
+    size_t output_input_dim() const {
+        return output_head_.in_dim;
+    }
+
+    Scalar output_theta() const {
+        return output_theta_;
+    }
+
+    void set_output_theta(Scalar theta) {
+        output_theta_ = theta;
+    }
+
+    std::vector<Scalar>& output_head_weights() {
+        return output_head_.w;
+    }
+
+    std::vector<Scalar>& output_head_bias() {
+        return output_head_.b;
+    }
+
+    const std::vector<Scalar>& output_head_weights() const {
+        return output_head_.w;
+    }
+
+    const std::vector<Scalar>& output_head_bias() const {
+        return output_head_.b;
+    }
+
+    size_t action_dim() const {
+        return action_head_.out_dim;
+    }
+
+    size_t action_input_dim() const {
+        return action_head_.in_dim;
+    }
+
+    std::vector<Scalar>& action_head_weights() {
+        return action_head_.w;
+    }
+
+    std::vector<Scalar>& action_head_bias() {
+        return action_head_.b;
+    }
+
+    const std::vector<Scalar>& action_head_weights() const {
+        return action_head_.w;
+    }
+
+    const std::vector<Scalar>& action_head_bias() const {
+        return action_head_.b;
+    }
+
+    size_t hidden_layer_count() const {
+        return hidden_layers_.size();
+    }
+
+    std::vector<Vector>& embedding_table() {
+        return embed_table_;
+    }
+
+    const std::vector<Vector>& embedding_table() const {
+        return embed_table_;
+    }
+
+    LinearProj& proj_q_layer() { return proj_q_; }
+    LinearProj& gate_q_layer() { return gate_q_; }
+    LinearProj& proj_k_layer() { return proj_k_; }
+    LinearProj& gate_k_layer() { return gate_k_; }
+    LinearProj& proj_v_layer() { return proj_v_; }
+    LinearProj& gate_v_layer() { return gate_v_; }
+    LinearProj& proj_r_layer() { return proj_r_; }
+    LinearProj& gate_r_layer() { return gate_r_; }
+    LinearProj& loop_proj_layer() { return loop_proj_; }
+
+    std::vector<LinearProj>& hidden_stack_layers() {
+        return hidden_layers_;
+    }
+
+    const std::vector<LinearProj>& hidden_stack_layers() const {
+        return hidden_layers_;
     }
 };
 

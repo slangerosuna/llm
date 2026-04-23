@@ -1,7 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <future>
+#include <string>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -9,6 +12,16 @@
 #include <sycl/sycl.hpp>
 
 namespace llm::arch {
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define LLM_ASAN_BUILD 1
+#endif
+#endif
+
+#if defined(__SANITIZE_ADDRESS__)
+#define LLM_ASAN_BUILD 1
+#endif
 
 #if defined(__STDCPP_FLOAT16_T__)
 using Scalar = std::float16_t;
@@ -22,15 +35,70 @@ using Matrix = std::vector<Vector>;
 
 namespace sycl_ops {
 
+inline std::atomic<uint64_t>& kernel_launch_counter() {
+	static std::atomic<uint64_t> counter{0};
+	return counter;
+}
+
+inline void reset_kernel_launch_counter() {
+	kernel_launch_counter().store(0, std::memory_order_relaxed);
+}
+
+inline uint64_t kernel_launch_count() {
+	return kernel_launch_counter().load(std::memory_order_relaxed);
+}
+
+inline bool env_flag_set(const char* name) {
+	const char* v = std::getenv(name);
+	if (!v) {
+		return false;
+	}
+	return std::string(v) != "0" && std::string(v) != "false" && std::string(v) != "FALSE";
+}
+
 inline sycl::queue& default_queue() {
 	static sycl::queue q = [] {
+		const bool require_gpu = env_flag_set("LLM_REQUIRE_GPU");
+
+		if (require_gpu) {
+			return sycl::queue{sycl::gpu_selector_v};
+		}
+
 		try {
 			return sycl::queue{sycl::gpu_selector_v};
 		} catch (...) {
-			return sycl::queue{sycl::default_selector_v};
+			try {
+				return sycl::queue{sycl::default_selector_v};
+			} catch (...) {
+				throw std::runtime_error(
+					"SYCL queue creation failed for both GPU and default selectors. "
+					"Set ONEAPI_DEVICE_SELECTOR or SYCL_DEVICE_FILTER to a valid GPU.");
+			}
 		}
 	}();
 	return q;
+}
+
+inline bool use_sycl_kernels() {
+	static bool use = [] {
+		if (env_flag_set("LLM_FORCE_CPU_MATH")) {
+			return false;
+		}
+		if (env_flag_set("LLM_FORCE_SYCL_MATH")) {
+			return true;
+		}
+
+		#if defined(LLM_ASAN_BUILD)
+		return false;
+		#else
+		try {
+			return !default_queue().get_device().is_cpu();
+		} catch (...) {
+			return false;
+		}
+		#endif
+	}();
+	return use;
 }
 
 inline Scalar dot(const Vector& a, const Vector& b) {
@@ -40,6 +108,14 @@ inline Scalar dot(const Vector& a, const Vector& b) {
 	if (a.empty()) {
 		return static_cast<Scalar>(0.0f);
 	}
+
+	if (!use_sycl_kernels()) {
+	float result = 0.0f;
+	for (size_t i = 0; i < a.size(); ++i) {
+		result += static_cast<float>(a[i]) * static_cast<float>(b[i]);
+	}
+	return static_cast<Scalar>(result);
+}
 
 	auto& q = default_queue();
 	sycl::buffer<Scalar> a_buf(a.data(), sycl::range<1>(a.size()));
@@ -55,6 +131,7 @@ inline Scalar dot(const Vector& a, const Vector& b) {
 			acc += static_cast<float>(a_acc[i]) * static_cast<float>(b_acc[i]);
 		});
 	});
+	kernel_launch_counter().fetch_add(1, std::memory_order_relaxed);
 	q.wait();
 	return static_cast<Scalar>(result);
 }
@@ -70,6 +147,18 @@ inline Vector linear(
 	}
 
 	Vector y(out_dim, static_cast<Scalar>(0.0f));
+
+	if (!use_sycl_kernels()) {
+	for (size_t o = 0; o < out_dim; ++o) {
+		float s = static_cast<float>(b[o]);
+		for (size_t i = 0; i < in_dim; ++i) {
+			s += static_cast<float>(w[o * in_dim + i]) * static_cast<float>(x[i]);
+		}
+		y[o] = static_cast<Scalar>(s);
+	}
+	return y;
+}
+
 	auto& q = default_queue();
 	sycl::buffer<Scalar> w_buf(w.data(), sycl::range<1>(w.size()));
 	sycl::buffer<Scalar> x_buf(x.data(), sycl::range<1>(x.size()));
@@ -90,6 +179,7 @@ inline Vector linear(
 			y_acc[o] = static_cast<Scalar>(s);
 		});
 	});
+	kernel_launch_counter().fetch_add(1, std::memory_order_relaxed);
 	q.wait();
 
 	return y;

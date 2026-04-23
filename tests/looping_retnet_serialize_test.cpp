@@ -14,6 +14,7 @@ int main() {
     cfg.qk_dim = 16;
     cfg.v_dim = 16;
     cfg.rel_dim = 8;
+    cfg.hidden_layers = 2;
     cfg.max_steps = 4;
 
     const std::string path = "/tmp/looping_retnet_roundtrip.bin";

@@ -9,6 +9,16 @@
 
 namespace llm::arch::activation {
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define LLM_ASAN_BUILD 1
+#endif
+#endif
+
+#if defined(__SANITIZE_ADDRESS__)
+#define LLM_ASAN_BUILD 1
+#endif
+
 inline Scalar sigmoid(Scalar x) {
 	const float xf = static_cast<float>(x);
 	if (x >= 0.0f) {
@@ -34,6 +44,17 @@ inline Vector swiglu(const Vector& x, const Vector& gate) {
 	}
 
 	Vector out(x.size(), static_cast<Scalar>(0.0f));
+
+	if (!sycl_ops::use_sycl_kernels()) {
+	for (size_t i = 0; i < x.size(); ++i) {
+		const float xv = static_cast<float>(x[i]);
+		const float gv = static_cast<float>(gate[i]);
+		const float s = 1.0f / (1.0f + std::exp(-xv));
+		out[i] = static_cast<Scalar>((xv * s) * gv);
+	}
+	return out;
+}
+
 	sycl::buffer<Scalar> x_buf(x.data(), sycl::range<1>(x.size()));
 	sycl::buffer<Scalar> g_buf(gate.data(), sycl::range<1>(gate.size()));
 	sycl::buffer<Scalar> o_buf(out.data(), sycl::range<1>(out.size()));
@@ -69,6 +90,20 @@ inline SwiGLUGrad dswiglu(
 
 	SwiGLUGrad grad{Vector(x.size(), static_cast<Scalar>(0.0f)), Vector(x.size(), static_cast<Scalar>(0.0f))};
 
+	if (!sycl_ops::use_sycl_kernels()) {
+	for (size_t i = 0; i < x.size(); ++i) {
+		const float xv = static_cast<float>(x[i]);
+		const float gv = static_cast<float>(gate[i]);
+		const float dv = static_cast<float>(dout[i]);
+		const float s = 1.0f / (1.0f + std::exp(-xv));
+		const float swish = xv * s;
+		const float dswish_dx = s + xv * s * (1.0f - s);
+		grad.dx[i] = static_cast<Scalar>(dv * gv * dswish_dx);
+		grad.dgate[i] = static_cast<Scalar>(dv * swish);
+	}
+	return grad;
+}
+
 	sycl::buffer<Scalar> x_buf(x.data(), sycl::range<1>(x.size()));
 	sycl::buffer<Scalar> g_buf(gate.data(), sycl::range<1>(gate.size()));
 	sycl::buffer<Scalar> d_buf(dout.data(), sycl::range<1>(dout.size()));
@@ -101,6 +136,14 @@ inline SwiGLUGrad dswiglu(
 inline Vector param_tanh(const Vector& x, Scalar theta, Scalar epsilon = static_cast<Scalar>(1e-6f)) {
 	const float a = static_cast<float>(softplus(theta)) + static_cast<float>(epsilon);
 	Vector out(x.size(), static_cast<Scalar>(0.0f));
+
+	if (!sycl_ops::use_sycl_kernels()) {
+	for (size_t i = 0; i < x.size(); ++i) {
+		const float xv = static_cast<float>(x[i]);
+		out[i] = static_cast<Scalar>(std::tanh(a * xv));
+	}
+	return out;
+}
 
 	sycl::buffer<Scalar> x_buf(x.data(), sycl::range<1>(x.size()));
 	sycl::buffer<Scalar> o_buf(out.data(), sycl::range<1>(out.size()));
@@ -137,6 +180,19 @@ inline ParamTanhGrad dparam_tanh(
 
 	Vector dx(x.size(), static_cast<Scalar>(0.0f));
 	float dtheta = 0.0f;
+
+	if (!sycl_ops::use_sycl_kernels()) {
+	for (size_t i = 0; i < x.size(); ++i) {
+		const float xv = static_cast<float>(x[i]);
+		const float dv = static_cast<float>(dout[i]);
+		const float t = std::tanh(a * xv);
+		const float sech2 = 1.0f - t * t;
+		dx[i] = static_cast<Scalar>(dv * sech2 * a);
+		dtheta += dv * sech2 * xv * da_dtheta;
+	}
+	return ParamTanhGrad{std::move(dx), static_cast<Scalar>(dtheta)};
+}
+
 	auto& q = sycl_ops::default_queue();
 
 	sycl::buffer<Scalar> x_buf(x.data(), sycl::range<1>(x.size()));

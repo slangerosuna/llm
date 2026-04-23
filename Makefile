@@ -11,7 +11,7 @@ JOBS ?= $(shell nproc)
 -include .env
 export
 
-.PHONY: build test run configure clean
+.PHONY: build test run configure clean benchmark
 
 configure:
 	@command -v $(SYCL_CXX) >/dev/null || (echo "Compiler '$(SYCL_CXX)' not found on PATH" && exit 1)
@@ -27,6 +27,9 @@ test: build
 
 run: build
 	./$(BUILD_DIR)/llm_sycl
+
+benchmark: build
+	./scripts/run_training_benchmarks.sh
 
 clean:
 	rm -rf $(BUILD_DIR)
