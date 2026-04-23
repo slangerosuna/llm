@@ -136,33 +136,29 @@ inline ParamTanhGrad dparam_tanh(
 	const float da_dtheta = static_cast<float>(sigmoid(theta));
 
 	Vector dx(x.size(), static_cast<Scalar>(0.0f));
-	std::vector<float> dtheta_partials(x.size(), 0.0f);
+	float dtheta = 0.0f;
+	auto& q = sycl_ops::default_queue();
 
 	sycl::buffer<Scalar> x_buf(x.data(), sycl::range<1>(x.size()));
 	sycl::buffer<Scalar> d_buf(dout.data(), sycl::range<1>(dout.size()));
 	sycl::buffer<Scalar> dx_buf(dx.data(), sycl::range<1>(dx.size()));
-	sycl::buffer<float> dt_buf(dtheta_partials.data(), sycl::range<1>(dtheta_partials.size()));
+	sycl::buffer<float> dt_buf(&dtheta, sycl::range<1>(1));
 
-	sycl_ops::default_queue().submit([&](sycl::handler& h) {
+	q.submit([&](sycl::handler& h) {
 		auto x_acc = x_buf.get_access<sycl::access::mode::read>(h);
 		auto d_acc = d_buf.get_access<sycl::access::mode::read>(h);
 		auto dx_acc = dx_buf.get_access<sycl::access::mode::discard_write>(h);
-		auto dt_acc = dt_buf.get_access<sycl::access::mode::discard_write>(h);
-		h.parallel_for(sycl::range<1>(x.size()), [=](sycl::id<1> i) {
+		auto dtheta_sum = sycl::reduction(dt_buf, h, sycl::plus<float>());
+		h.parallel_for(sycl::range<1>(x.size()), dtheta_sum, [=](sycl::id<1> i, auto& sum) {
 			const float xv = static_cast<float>(x_acc[i]);
 			const float dv = static_cast<float>(d_acc[i]);
 			const float t = sycl::tanh(a * xv);
 			const float sech2 = 1.0f - t * t;
 			dx_acc[i] = static_cast<Scalar>(dv * sech2 * a);
-			dt_acc[i] = dv * sech2 * xv * da_dtheta;
+			sum += dv * sech2 * xv * da_dtheta;
 		});
 	});
-	sycl_ops::default_queue().wait();
-
-	float dtheta = 0.0f;
-	for (float v : dtheta_partials) {
-		dtheta += v;
-	}
+	q.wait();
 
 	return ParamTanhGrad{std::move(dx), static_cast<Scalar>(dtheta)};
 }

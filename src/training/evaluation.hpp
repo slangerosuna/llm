@@ -8,6 +8,8 @@
 
 #include <sycl/sycl.hpp>
 
+#include <architecture/sequential.hpp>
+
 namespace llm::training::evaluation {
 
 #if defined(__STDCPP_FLOAT16_T__)
@@ -26,28 +28,24 @@ inline float mean_squared_error(const std::vector<Scalar>& pred, const std::vect
 		return 0.0f;
 	}
 
-	std::vector<float> sq(pred.size(), 0.0f);
-	sycl::queue q{sycl::default_selector_v};
+	auto& q = llm::arch::sycl_ops::default_queue();
 	sycl::buffer<Scalar> p_buf(pred.data(), sycl::range<1>(pred.size()));
 	sycl::buffer<Scalar> t_buf(target.data(), sycl::range<1>(target.size()));
-	sycl::buffer<float> s_buf(sq.data(), sycl::range<1>(sq.size()));
+	float sq_sum = 0.0f;
+	sycl::buffer<float> sum_buf(&sq_sum, sycl::range<1>(1));
 
 	q.submit([&](sycl::handler& h) {
 		auto p_acc = p_buf.get_access<sycl::access::mode::read>(h);
 		auto t_acc = t_buf.get_access<sycl::access::mode::read>(h);
-		auto s_acc = s_buf.get_access<sycl::access::mode::discard_write>(h);
-		h.parallel_for(sycl::range<1>(pred.size()), [=](sycl::id<1> i) {
+		auto sq_reduction = sycl::reduction(sum_buf, h, sycl::plus<float>());
+		h.parallel_for(sycl::range<1>(pred.size()), sq_reduction, [=](sycl::id<1> i, auto& acc) {
 			const float d = static_cast<float>(p_acc[i]) - static_cast<float>(t_acc[i]);
-			s_acc[i] = d * d;
+			acc += d * d;
 		});
 	});
 	q.wait();
 
-	float sum = 0.0f;
-	for (float v : sq) {
-		sum += v;
-	}
-	return sum / static_cast<float>(pred.size());
+	return sq_sum / static_cast<float>(pred.size());
 }
 
 inline float cross_entropy_from_probs(const std::vector<Scalar>& probs, size_t target_index, float eps = 1e-8f) {
