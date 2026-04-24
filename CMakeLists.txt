@@ -15,11 +15,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Enforce Boost lookup through FindBoost (module mode) because many distros
 # ship Boost without BoostConfig.cmake files.
-if(POLICY CMP0167)
-  cmake_policy(SET CMP0167 OLD)
-endif()
-set(Boost_NO_BOOST_CMAKE ON)
-find_package(Boost REQUIRED COMPONENTS json)
+# if(POLICY CMP0167)
+#   cmake_policy(SET CMP0167 OLD)
+# endif()
+# set(Boost_NO_BOOST_CMAKE ON)
+# find_package(Boost REQUIRED COMPONENTS json)
 
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-fsycl" COMPILER_SUPPORTS_FSYCL)
@@ -43,7 +43,7 @@ target_include_directories(llm_sycl PRIVATE
 
 target_compile_options(llm_sycl PRIVATE -fsycl -mavx2 -mf16c)
 target_link_options(llm_sycl PRIVATE -fsycl)
-target_link_libraries(llm_sycl PRIVATE Boost::json)
+# target_link_libraries(llm_sycl PRIVATE Boost::json)
 
 enable_testing()
 add_subdirectory(tests)

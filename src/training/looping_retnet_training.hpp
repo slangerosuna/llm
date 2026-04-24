@@ -33,12 +33,12 @@ enum class TrainMode : uint8_t {
 };
 
 struct TrainConfig {
-    TrainMode mode = TrainMode::FiniteDifference;
-    size_t epochs = 5;
-    float learning_rate = 1e-2f;      // peak LR after warmup
+    TrainMode mode = TrainMode::BackpropFull;
+    size_t epochs = 256;
+    float learning_rate = 2.0e-2f;      // peak LR after warmup
     float min_learning_rate = 1e-4f;  // absolute LR floor
     float min_learning_rate_ratio = 0.1f; // relative floor vs peak LR
-    size_t warmup_epochs = 2;         // linear warmup epochs
+    size_t warmup_epochs = 4;         // linear warmup epochs
     float warmup_start_ratio = 0.2f;  // warmup starts at peak_lr * ratio
     float loss_ema_beta = 0.9f;       // moving-average smoothing for logging
     float weight_decay = 1e-4f;
@@ -58,11 +58,11 @@ struct TrainConfig {
     size_t min_grad_coordinate_samples = 32;
 
     // Minibatch support used by both modes where applicable.
-    size_t batch_size = 1;
+    size_t batch_size = 32;
     bool disable_memory_writes_when_query_disabled = true;
 
     // Backprop-over-heads mode knobs.
-    bool backprop_force_single_step = true;
+    bool backprop_force_single_step = false;
     bool backprop_include_loop_supervision = true;
     size_t backprop_fd_check_samples = 0;
     float backprop_fd_check_eps = 1e-3f;
@@ -73,6 +73,8 @@ struct TrainConfig {
     float memory_alignment_weight = 0.1f;
     float memory_edge_budget_penalty = 0.02f;
     float loop_supervision_weight = 0.2f;
+    float force_query_prob = 0.15f;
+    float load_gate_supervision_weight = 0.1f;
     bool force_output = false;          // keep false for full looping behavior
     bool enable_query = true;
     bool use_parallel_retention = true;
@@ -81,6 +83,8 @@ struct TrainConfig {
     size_t forced_loop_max = 5;
 
     uint32_t seed = 7;
+    // 0 = use all examples each epoch; >0 = randomly sample this many (with replacement)
+    size_t samples_per_epoch = 0;
 
     memory::MemoryConfig memory_cfg{};
 };
@@ -233,6 +237,15 @@ class LoopingRetNetSGDTrainer {
         return std::max(0.0f, -lp);
     }
 
+    static std::pair<float, float> binary_ce_and_grad(float logit, float target) {
+        const float p = 1.0f / (1.0f + std::exp(-logit));
+        const float eps = 1e-6f;
+        const float ce = -(target * std::log(std::max(eps, p))
+            + (1.0f - target) * std::log(std::max(eps, 1.0f - p)));
+        const float grad = p - target;
+        return {ce, grad};
+    }
+
     static float cross_entropy_from_logits(const arch::Vector& logits, uint8_t target) {
         if (logits.empty()) {
             throw std::runtime_error("LoopingRetNetSGDTrainer: empty logits");
@@ -336,17 +349,25 @@ class LoopingRetNetSGDTrainer {
         return grad;
     }
 
-    static size_t loop_supervision_target_from_logits(
+    static size_t action_supervision_target_from_logits(
         const arch::Vector& current_output_logits,
         const arch::Vector& next_output_logits,
-        uint8_t target)
+        uint8_t target,
+        bool enable_query,
+        size_t decision_index)
     {
         const float cur_ce = cross_entropy_from_logits(current_output_logits, target);
         const float nxt_ce = cross_entropy_from_logits(next_output_logits, target);
-        const bool should_loop = (nxt_ce + 1e-4f) < cur_ce;
-        return should_loop
-            ? static_cast<size_t>(llm::arch::ModelAction::LOOP)
-            : static_cast<size_t>(llm::arch::ModelAction::OUTPUT);
+        const bool should_defer_output = (nxt_ce + 1e-4f) < cur_ce;
+        if (!should_defer_output) {
+            return static_cast<size_t>(llm::arch::ModelAction::OUTPUT);
+        }
+        // Prefer QUERY on the first deferred decision when querying is enabled.
+        // Subsequent deferrals are supervised as LOOP.
+        if (enable_query && decision_index == 0) {
+            return static_cast<size_t>(llm::arch::ModelAction::QUERY_MEMORY);
+        }
+        return static_cast<size_t>(llm::arch::ModelAction::LOOP);
     }
 
     static arch::Vector dgroup_norm(
@@ -405,6 +426,9 @@ class LoopingRetNetSGDTrainer {
         if (steps == 0) {
             return 0.0f;
         }
+        std::uniform_int_distribution<size_t> start_dist(0, steps - 1);
+        const size_t start = start_dist(rng);
+        const size_t used_steps = steps;
 
         const auto& mcfg = cfg_.memory_cfg;
         const arch::LoopConfig& lcfg = model.config();
@@ -425,10 +449,13 @@ class LoopingRetNetSGDTrainer {
         const size_t loop_min = std::max<size_t>(1, cfg_.forced_loop_min);
         const size_t loop_max = std::max(loop_min, std::min<size_t>(cfg_.forced_loop_max, model.config().max_steps));
         std::uniform_int_distribution<size_t> loop_dist(loop_min, loop_max);
+        std::bernoulli_distribution force_query_dist(std::clamp(cfg_.force_query_prob, 0.0f, 1.0f));
 
         float loss = 0.0f;
-        for (size_t t = 0; t < steps; ++t) {
+        for (size_t ti = 0; ti < used_steps; ++ti) {
+            const size_t t = (start + ti) % steps;
             const size_t forced_loops = loop_dist(rng);
+            const bool force_query_first = cfg_.enable_query && force_query_dist(rng);
             const auto trace = model.step_with_trace(
                 ex.input[t],
                 recurrent_state,
@@ -438,25 +465,25 @@ class LoopingRetNetSGDTrainer {
                 cfg_.force_output,
                 cfg_.enable_query,
                 forced_loops,
-                cfg_.use_parallel_retention);
+                cfg_.use_parallel_retention,
+                true,
+                force_query_first);
 
             loss += cross_entropy_from_logits(trace.logits, static_cast<uint8_t>(ex.target[t]));
             if (!std::isfinite(loss)) {
                 return kNonFinitePenalty;
             }
 
-            // Train the loop decision output: if doing one more loop lowered
-            // output CE, supervise LOOP; otherwise supervise OUTPUT.
+            // Train the action decision output: if delaying output helps,
+            // supervise QUERY first (when enabled), then LOOP; otherwise OUTPUT.
             if (trace.per_step_output_logits.size() > 1 && trace.per_step_action_logits.size() == trace.per_step_output_logits.size()) {
                 for (size_t i = 0; i + 1 < trace.per_step_output_logits.size(); ++i) {
-                    const float cur_ce = cross_entropy_from_logits(
-                        trace.per_step_output_logits[i], static_cast<uint8_t>(ex.target[t]));
-                    const float nxt_ce = cross_entropy_from_logits(
-                        trace.per_step_output_logits[i + 1], static_cast<uint8_t>(ex.target[t]));
-                    const bool should_loop = (nxt_ce + 1e-4f) < cur_ce;
-                    const size_t target = should_loop
-                        ? static_cast<size_t>(llm::arch::ModelAction::LOOP)
-                        : static_cast<size_t>(llm::arch::ModelAction::OUTPUT);
+                    const size_t target = action_supervision_target_from_logits(
+                        trace.per_step_output_logits[i],
+                        trace.per_step_output_logits[i + 1],
+                        static_cast<uint8_t>(ex.target[t]),
+                        cfg_.enable_query,
+                        i);
                     loss += cfg_.loop_supervision_weight
                         * action_ce_from_logits(trace.per_step_action_logits[i], target);
                     if (!std::isfinite(loss)) {
@@ -467,6 +494,19 @@ class LoopingRetNetSGDTrainer {
 
             if (cfg_.enable_query && trace.query_count == 0) {
                 loss += cfg_.memory_query_penalty;
+            }
+
+            if (!trace.per_step_load_logits.empty() && trace.per_step_load_logits.size() == trace.per_step_query_hits.size()) {
+                for (size_t li = 0; li < trace.per_step_load_logits.size(); ++li) {
+                    const float target_load = static_cast<float>(trace.per_step_query_hits[li]);
+                    const auto [load_ce, _] = binary_ce_and_grad(
+                        static_cast<float>(trace.per_step_load_logits[li]),
+                        target_load);
+                    loss += cfg_.load_gate_supervision_weight * load_ce;
+                    if (!std::isfinite(loss)) {
+                        return kNonFinitePenalty;
+                    }
+                }
             }
 
             if (cfg_.enable_query && !kv_cache.keys.empty()) {
@@ -486,7 +526,7 @@ class LoopingRetNetSGDTrainer {
             }
 
             // Prevent unchecked KV-cache growth from dominating compute.
-            const float allowed_edges = static_cast<float>(cfg_.memory_cfg.max_write_entries * (t + 1));
+            const float allowed_edges = static_cast<float>(cfg_.memory_cfg.max_write_entries * (ti + 1));
             const float actual_edges = static_cast<float>(kv_cache.keys.size());
             if (actual_edges > allowed_edges) {
                 loss += cfg_.memory_edge_budget_penalty * (actual_edges - allowed_edges);
@@ -496,7 +536,7 @@ class LoopingRetNetSGDTrainer {
             }
         }
 
-        const float avg = loss / static_cast<float>(steps);
+        const float avg = loss / static_cast<float>(used_steps);
         if (!std::isfinite(avg)) {
             return kNonFinitePenalty;
         }
@@ -561,6 +601,10 @@ public:
         bool has_ema = false;
         const float ema_beta = std::clamp(cfg_.loss_ema_beta, 0.0f, 0.9999f);
 
+        auto last_print_time = std::chrono::steady_clock::now();
+        float inter_loss_delta = 0.0f;
+        bool inter_unstable = false;
+
         for (size_t epoch = 0; epoch < cfg_.epochs; ++epoch) {
             const auto epoch_t0 = std::chrono::steady_clock::now();
             llm::arch::sycl_ops::reset_kernel_launch_counter();
@@ -583,6 +627,74 @@ public:
             double seq_forward_ms = 0.0;
             float gradcheck_rel_err_sum = 0.0f;
             size_t gradcheck_count = 0;
+
+            // Build the per-epoch sample. With samples_per_epoch==0 the full dataset
+            // is used (shuffled); otherwise cfg_.samples_per_epoch examples are drawn
+            // with replacement so epoch cost is independent of dataset size.
+            std::vector<SequenceExample> epoch_dataset_storage;
+            const std::vector<SequenceExample>* epoch_dataset_ptr = &dataset;
+            if (cfg_.samples_per_epoch > 0 && cfg_.samples_per_epoch < dataset.size()) {
+                epoch_dataset_storage.reserve(cfg_.samples_per_epoch);
+                std::uniform_int_distribution<size_t> idx_dist(0, dataset.size() - 1);
+                for (size_t s = 0; s < cfg_.samples_per_epoch; ++s) {
+                    epoch_dataset_storage.push_back(dataset[idx_dist(rng)]);
+                }
+                epoch_dataset_ptr = &epoch_dataset_storage;
+            }
+            const std::vector<SequenceExample>& epoch_dataset = *epoch_dataset_ptr;
+
+            const char* mode_name_ep = (cfg_.mode == TrainMode::FiniteDifference)
+                ? "FD"
+                : (cfg_.mode == TrainMode::BackpropHeads ? "BP_HEADS" : "BP_FULL");
+
+            auto maybe_print = [&](float cur_loss, size_t ep_done, size_t ep_total) {
+                const auto now = std::chrono::steady_clock::now();
+                const double since_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - last_print_time).count();
+                if (since_ms < 100.0) return;
+                last_print_time = now;
+                const double elapsed_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - epoch_t0).count();
+                const double elapsed_s = std::max(1e-6, elapsed_ms / 1000.0);
+                const double cur_tok_s = static_cast<double>(epoch_token_count) / elapsed_s;
+                const double cur_ex_s = static_cast<double>(epoch_example_count) / elapsed_s;
+                const uint64_t cur_kernels = llm::arch::sycl_ops::kernel_launch_count();
+                const float cur_gradcheck_err = (gradcheck_count == 0)
+                    ? 0.0f
+                    : (gradcheck_rel_err_sum / static_cast<float>(gradcheck_count));
+                const float cur_skip_ratio = (grad_samples_epoch > 0)
+                    ? static_cast<float>(nonfinite_skips) / static_cast<float>(grad_samples_epoch)
+                    : 0.0f;
+                std::cout
+                    << "Epoch " << (epoch + 1) << "/" << cfg_.epochs
+                    << " - Prog: " << ep_done << "/" << ep_total
+                    << " (" << (ep_total > 0 ? static_cast<int>(100.0 * ep_done / ep_total) : 0) << "%)"
+                    << " - Mode: " << mode_name_ep
+                    << " - LR: " << lr_epoch
+                    << " - BaseLR: " << base_lr_epoch
+                    << " - LRScale: " << lr_multiplier
+                    << " - FDsamples: " << grad_samples_epoch
+                    << " - Loss: " << cur_loss
+                    << " - LossDelta: " << inter_loss_delta
+                    << " - LossEMA: " << loss_ema
+                    << " - FDms: " << fd_ms
+                    << " - SeqMs: " << seq_forward_ms
+                    << " - ObjEvals: " << objective_evals
+                    << " - QueryEvents: " << query_events
+                    << " - EpochMs: " << elapsed_ms
+                    << " - Tok/s: " << cur_tok_s
+                    << " - Ex/s: " << cur_ex_s
+                    << " - Kernels: " << cur_kernels
+                    << " - GradCheckRelErr: " << cur_gradcheck_err
+                    << " - ActiveGrad%: " << (100.0f * active_grad_fraction)
+                    << " - NonFiniteSkips: " << nonfinite_skips
+                    << " - Skip%: " << (100.0f * cur_skip_ratio);
+                if (repaired > 0) {
+                    std::cout << " - Repaired: " << repaired;
+                }
+                if (inter_unstable) {
+                    std::cout << " - LRBackoff";
+                }
+                std::cout << "\n";
+            };
 
             if (cfg_.mode == TrainMode::FiniteDifference) {
                 grad_samples_epoch = grad_samples_for_epoch(epoch + 1);
@@ -610,7 +722,7 @@ public:
                     *refs[idx] = static_cast<Scalar>(static_cast<float>(original) + cfg_.fd_eps);
                     std::mt19937 rng_plus = eval_rng_state;
                     const auto eval_t0 = std::chrono::steady_clock::now();
-                    const float l_plus = dataset_loss(model, dataset, rng_plus);
+                    const float l_plus = dataset_loss(model, epoch_dataset, rng_plus);
                     const auto eval_t1 = std::chrono::steady_clock::now();
                     seq_forward_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(eval_t1 - eval_t0).count();
                     ++objective_evals;
@@ -618,7 +730,7 @@ public:
                     *refs[idx] = static_cast<Scalar>(static_cast<float>(original) - cfg_.fd_eps);
                     std::mt19937 rng_minus = eval_rng_state;
                     const auto eval_t2 = std::chrono::steady_clock::now();
-                    const float l_minus = dataset_loss(model, dataset, rng_minus);
+                    const float l_minus = dataset_loss(model, epoch_dataset, rng_minus);
                     const auto eval_t3 = std::chrono::steady_clock::now();
                     seq_forward_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(eval_t3 - eval_t2).count();
                     ++objective_evals;
@@ -639,6 +751,7 @@ public:
                     tensor.grads[idx] = static_cast<Scalar>(
                         static_cast<float>(tensor.grads[idx]) + g_clipped);
                     ++grad_hits[idx];
+                    maybe_print(epoch_loss, s + 1, coord_indices.size());
                 }
 
                 for (size_t i = 0; i < tensor.grads.size(); ++i) {
@@ -678,11 +791,11 @@ public:
                 }
 
                 const auto eval_epoch_t0 = std::chrono::steady_clock::now();
-                epoch_loss = dataset_loss(model, dataset, rng);
+                epoch_loss = dataset_loss(model, epoch_dataset, rng);
                 const auto eval_epoch_t1 = std::chrono::steady_clock::now();
                 seq_forward_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(eval_epoch_t1 - eval_epoch_t0).count();
                 ++objective_evals;
-                for (const auto& ex : dataset) {
+                for (const auto& ex : epoch_dataset) {
                     epoch_example_count += 1;
                     epoch_token_count += std::min(ex.input.size(), ex.target.size());
                 }
@@ -693,17 +806,20 @@ public:
                 auto& out_b = model.output_head_bias();
                 auto& act_w = model.action_head_weights();
                 auto& act_b = model.action_head_bias();
+                auto& load_w = model.load_gate_weights();
+                auto& load_b = model.load_gate_bias();
 
                 const size_t out_in = model.output_input_dim();
                 const size_t out_dim = model.output_dim();
                 const size_t act_in = model.action_input_dim();
                 const size_t act_dim = model.action_dim();
+                const size_t load_in = model.load_gate_input_dim();
 
                 const auto bp_t0 = std::chrono::steady_clock::now();
                 float epoch_loss_acc = 0.0f;
 
-                for (size_t batch_start = 0; batch_start < dataset.size(); batch_start += cfg_.batch_size) {
-                    const size_t batch_end = std::min(batch_start + cfg_.batch_size, dataset.size());
+                for (size_t batch_start = 0; batch_start < epoch_dataset.size(); batch_start += cfg_.batch_size) {
+                    const size_t batch_end = std::min(batch_start + cfg_.batch_size, epoch_dataset.size());
 
                     ParameterTensor p_out_w;
                     p_out_w.values = out_w;
@@ -726,10 +842,21 @@ public:
                         p_act_b.grads.assign(act_b.size(), static_cast<Scalar>(0.0f));
                     }
 
+                    ParameterTensor p_load_w;
+                    ParameterTensor p_load_b;
+                    if (cfg_.enable_query) {
+                        p_load_w.values = load_w;
+                        p_load_w.grads.assign(load_w.size(), static_cast<Scalar>(0.0f));
+                        p_load_b.values = load_b;
+                        p_load_b.grads.assign(load_b.size(), static_cast<Scalar>(0.0f));
+                    }
+
+                    std::bernoulli_distribution force_query_dist(std::clamp(cfg_.force_query_prob, 0.0f, 1.0f));
+
                     size_t batch_tokens = 0;
 
                     for (size_t exi = batch_start; exi < batch_end; ++exi) {
-                        const auto& ex = dataset[exi];
+                        const auto& ex = epoch_dataset[exi];
                         if (ex.input.empty() || ex.target.empty()) {
                             continue;
                         }
@@ -738,6 +865,8 @@ public:
                         if (steps == 0) {
                             continue;
                         }
+                        std::uniform_int_distribution<size_t> start_dist(0, steps - 1);
+                        const size_t start = start_dist(rng);
 
                         Graph graph;
                         SpatialMap spatial_map;
@@ -748,13 +877,15 @@ public:
                         arch::KVState recurrent_state;
                         arch::AttentionMemory kv_cache;
 
-                        for (size_t t = 0; t < steps; ++t) {
+                        for (size_t ti = 0; ti < steps; ++ti) {
+                            const size_t t = (start + ti) % steps;
                             const bool use_query = cfg_.backprop_force_single_step ? false : cfg_.enable_query;
                             const bool force_output = cfg_.backprop_force_single_step ? true : cfg_.force_output;
                             const size_t forced_loops = cfg_.backprop_force_single_step
                                 ? 1
                                 : std::max<size_t>(1, cfg_.forced_loop_min);
                             const bool write_memory = !cfg_.disable_memory_writes_when_query_disabled || use_query;
+                            const bool force_query_first = use_query && force_query_dist(rng);
 
                             const auto trace_t0 = std::chrono::steady_clock::now();
                             const auto trace = model.step_with_trace(
@@ -767,7 +898,8 @@ public:
                                 use_query,
                                 forced_loops,
                                 false,
-                                write_memory);
+                                write_memory,
+                                force_query_first);
                             const auto trace_t1 = std::chrono::steady_clock::now();
                             seq_forward_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(trace_t1 - trace_t0).count();
                             query_events += trace.query_count;
@@ -851,10 +983,12 @@ public:
                                 && trace.per_step_output_logits.size() > 1
                                 && trace.per_step_action_logits.size() == trace.per_step_states.size()) {
                                 for (size_t si = 0; si + 1 < trace.per_step_output_logits.size(); ++si) {
-                                    const size_t target_action = loop_supervision_target_from_logits(
+                                    const size_t target_action = action_supervision_target_from_logits(
                                         trace.per_step_output_logits[si],
                                         trace.per_step_output_logits[si + 1],
-                                        static_cast<uint8_t>(ex.target[t]));
+                                        static_cast<uint8_t>(ex.target[t]),
+                                        cfg_.enable_query,
+                                        si);
                                     float action_ce = 0.0f;
                                     arch::Vector d_action = softmax_ce_grad_from_logits(
                                         trace.per_step_action_logits[si],
@@ -876,6 +1010,30 @@ public:
                                             p_act_w.grads[wi] = static_cast<Scalar>(
                                                 static_cast<float>(p_act_w.grads[wi]) + dag * static_cast<float>(state[i]));
                                         }
+                                    }
+                                }
+                            }
+
+                            if (cfg_.enable_query
+                                && trace.per_step_load_logits.size() == trace.per_step_states.size()
+                                && trace.per_step_query_hits.size() == trace.per_step_states.size()) {
+                                for (size_t si = 0; si < trace.per_step_states.size(); ++si) {
+                                    const float target_load = static_cast<float>(trace.per_step_query_hits[si]);
+                                    const auto [load_ce, d_logit] = binary_ce_and_grad(
+                                        static_cast<float>(trace.per_step_load_logits[si]),
+                                        target_load);
+                                    if (!std::isfinite(load_ce) || !std::isfinite(d_logit)) {
+                                        ++nonfinite_skips;
+                                        continue;
+                                    }
+                                    epoch_loss_acc += cfg_.load_gate_supervision_weight * load_ce;
+                                    const float d = cfg_.load_gate_supervision_weight * d_logit;
+                                    p_load_b.grads[0] = static_cast<Scalar>(
+                                        static_cast<float>(p_load_b.grads[0]) + d);
+                                    const auto& state = trace.per_step_states[si];
+                                    for (size_t i = 0; i < load_in; ++i) {
+                                        p_load_w.grads[i] = static_cast<Scalar>(
+                                            static_cast<float>(p_load_w.grads[i]) + d * static_cast<float>(state[i]));
                                     }
                                 }
                             }
@@ -906,6 +1064,14 @@ public:
                             g = static_cast<Scalar>(static_cast<float>(g) * inv);
                         }
                     }
+                    if (cfg_.enable_query) {
+                        for (auto& g : p_load_w.grads) {
+                            g = static_cast<Scalar>(static_cast<float>(g) * inv);
+                        }
+                        for (auto& g : p_load_b.grads) {
+                            g = static_cast<Scalar>(static_cast<float>(g) * inv);
+                        }
+                    }
 
                     std::vector<ParameterTensor> params;
                     params.push_back(p_out_w);
@@ -915,14 +1081,23 @@ public:
                         params.push_back(p_act_w);
                         params.push_back(p_act_b);
                     }
+                    if (cfg_.enable_query) {
+                        params.push_back(p_load_w);
+                        params.push_back(p_load_b);
+                    }
                     optimizer.step(params);
 
                     p_out_w = params[0];
                     p_out_b = params[1];
                     p_theta = params[2];
+                    size_t p_idx = 3;
                     if (cfg_.backprop_include_loop_supervision) {
-                        p_act_w = params[3];
-                        p_act_b = params[4];
+                        p_act_w = params[p_idx++];
+                        p_act_b = params[p_idx++];
+                    }
+                    if (cfg_.enable_query) {
+                        p_load_w = params[p_idx++];
+                        p_load_b = params[p_idx++];
                     }
 
                     for (size_t i = 0; i < out_w.size(); ++i) {
@@ -967,6 +1142,29 @@ public:
                             act_b[i] = static_cast<Scalar>(std::clamp(v, -cfg_.max_parameter_abs, cfg_.max_parameter_abs));
                         }
                     }
+                    if (cfg_.enable_query) {
+                        for (size_t i = 0; i < load_w.size(); ++i) {
+                            const float v = static_cast<float>(p_load_w.values[i]);
+                            if (!std::isfinite(v)) {
+                                ++repaired;
+                                continue;
+                            }
+                            load_w[i] = static_cast<Scalar>(std::clamp(v, -cfg_.max_parameter_abs, cfg_.max_parameter_abs));
+                        }
+                        for (size_t i = 0; i < load_b.size(); ++i) {
+                            const float v = static_cast<float>(p_load_b.values[i]);
+                            if (!std::isfinite(v)) {
+                                ++repaired;
+                                continue;
+                            }
+                            load_b[i] = static_cast<Scalar>(std::clamp(v, -cfg_.max_parameter_abs, cfg_.max_parameter_abs));
+                        }
+                    }
+                    maybe_print(epoch_token_count > 0
+                        ? epoch_loss_acc / static_cast<float>(epoch_token_count)
+                        : 0.0f,
+                        std::min(batch_start + cfg_.batch_size, epoch_dataset.size()),
+                        epoch_dataset.size());
                 }
 
                 const auto bp_t1 = std::chrono::steady_clock::now();
@@ -993,12 +1191,15 @@ public:
                 auto& out_b = model.output_head_bias();
                 auto& act_w = model.action_head_weights();
                 auto& act_b = model.action_head_bias();
+                auto& load_w = model.load_gate_weights();
+                auto& load_b = model.load_gate_bias();
 
                 const size_t model_dim = model.config().model_dim;
                 const size_t qk_dim = model.config().qk_dim;
                 const size_t v_dim = model.config().v_dim;
                 const size_t out_dim = model.output_dim();
                 const size_t act_dim = model.action_dim();
+                const size_t load_in = model.load_gate_input_dim();
 
                 auto linear_backward = [](
                     const std::vector<Scalar>& w,
@@ -1043,8 +1244,8 @@ public:
                 const auto bp_t0 = std::chrono::steady_clock::now();
                 float epoch_loss_acc = 0.0f;
 
-                for (size_t batch_start = 0; batch_start < dataset.size(); batch_start += cfg_.batch_size) {
-                    const size_t batch_end = std::min(batch_start + cfg_.batch_size, dataset.size());
+                for (size_t batch_start = 0; batch_start < epoch_dataset.size(); batch_start += cfg_.batch_size) {
+                    const size_t batch_end = std::min(batch_start + cfg_.batch_size, epoch_dataset.size());
 
                     ParameterTensor p_embed{flat_embeddings(), {}};
                     p_embed.grads.assign(p_embed.values.size(), static_cast<Scalar>(0.0f));
@@ -1078,129 +1279,218 @@ public:
                     ParameterTensor p_theta{{model.output_theta()}, {static_cast<Scalar>(0.0f)}};
                     ParameterTensor p_act_w{act_w, std::vector<Scalar>(act_w.size(), static_cast<Scalar>(0.0f))};
                     ParameterTensor p_act_b{act_b, std::vector<Scalar>(act_b.size(), static_cast<Scalar>(0.0f))};
+                    ParameterTensor p_load_w{load_w, std::vector<Scalar>(load_w.size(), static_cast<Scalar>(0.0f))};
+                    ParameterTensor p_load_b{load_b, std::vector<Scalar>(load_b.size(), static_cast<Scalar>(0.0f))};
 
                     size_t batch_tokens = 0;
 
                     for (size_t exi = batch_start; exi < batch_end; ++exi) {
-                        const auto& ex = dataset[exi];
+                        const auto& ex = epoch_dataset[exi];
                         const size_t steps = std::min(ex.input.size(), ex.target.size());
                         if (steps == 0) {
                             continue;
                         }
+                        std::uniform_int_distribution<size_t> start_dist(0, steps - 1);
+                        const size_t start = start_dist(rng);
 
-                        for (size_t t = 0; t < steps; ++t) {
-                            const uint8_t ch = static_cast<uint8_t>(ex.input[t]);
-                            const size_t emb_off = static_cast<size_t>(ch) * model_dim;
-
-                            arch::Vector x = embed[static_cast<size_t>(ch)];
-
-                            arch::Vector zq = arch::sycl_ops::linear(p_pq.values, qk_dim, model_dim, x, p_bq.values);
-                            arch::Vector gq = arch::sycl_ops::linear(p_gq.values, qk_dim, model_dim, x, p_bgq.values);
-                            arch::Vector q = arch::activation::swiglu(zq, gq);
-
-                            arch::Vector zk = arch::sycl_ops::linear(p_pk.values, qk_dim, model_dim, x, p_bk.values);
-                            arch::Vector gk = arch::sycl_ops::linear(p_gk.values, qk_dim, model_dim, x, p_bgk.values);
-                            arch::Vector k = arch::activation::swiglu(zk, gk);
-
-                            arch::Vector zv = arch::sycl_ops::linear(p_pv.values, v_dim, model_dim, x, p_bv.values);
-                            arch::Vector gv = arch::sycl_ops::linear(p_gv.values, v_dim, model_dim, x, p_bgv.values);
-                            arch::Vector v = arch::activation::swiglu(zv, gv);
-
-                            float alpha = 0.0f;
-                            for (size_t i = 0; i < q.size(); ++i) {
-                                alpha += static_cast<float>(q[i]) * static_cast<float>(k[i]);
-                            }
-
-                            arch::Vector y(v_dim, static_cast<Scalar>(0.0f));
-                            for (size_t i = 0; i < v_dim; ++i) {
-                                y[i] = static_cast<Scalar>(alpha * static_cast<float>(v[i]));
-                            }
-                            arch::Vector ret = arch::group_norm(y);
-
-                            arch::Vector state(v_dim, static_cast<Scalar>(0.0f));
-                            for (size_t i = 0; i < v_dim; ++i) {
-                                state[i] = static_cast<Scalar>(static_cast<float>(ret[i]) + static_cast<float>(v[i]));
-                            }
-
+                        struct StepCache {
+                            size_t emb_off = 0;
+                            uint8_t target = 0;
+                            arch::Vector x;
+                            arch::Vector zq, gq, q;
+                            arch::Vector zk, gk, k;
+                            arch::Vector zv, gv, v;
+                            arch::KVState retained_state;
+                            arch::Vector ret_raw;
+                            arch::Vector state;
                             std::vector<arch::Vector> hidden_inputs;
                             std::vector<arch::Vector> hidden_preacts;
-                            hidden_inputs.reserve(hidden.size());
-                            hidden_preacts.reserve(hidden.size());
-                            arch::Vector hstate = state;
+                            arch::Vector hstate;
+                            arch::Vector action_logits;
+                            Scalar load_logit = static_cast<Scalar>(0.0f);
+                            arch::Vector raw_logits;
+                            arch::Vector logits;
+                        };
+
+                        std::vector<StepCache> caches;
+                        caches.reserve(steps);
+
+                        arch::KVState recurrent_state(qk_dim, arch::Vector(v_dim, static_cast<Scalar>(0.0f)));
+                        bool sequence_valid = true;
+
+                        for (size_t ti = 0; ti < steps; ++ti) {
+                            const size_t t = (start + ti) % steps;
+                            StepCache sc;
+                            const uint8_t ch = static_cast<uint8_t>(ex.input[t]);
+                            sc.emb_off = static_cast<size_t>(ch) * model_dim;
+                            sc.target = static_cast<uint8_t>(ex.target[t]);
+                            sc.x = embed[static_cast<size_t>(ch)];
+
+                            sc.zq = arch::sycl_ops::linear(p_pq.values, qk_dim, model_dim, sc.x, p_bq.values);
+                            sc.gq = arch::sycl_ops::linear(p_gq.values, qk_dim, model_dim, sc.x, p_bgq.values);
+                            sc.q = arch::activation::swiglu(sc.zq, sc.gq);
+
+                            sc.zk = arch::sycl_ops::linear(p_pk.values, qk_dim, model_dim, sc.x, p_bk.values);
+                            sc.gk = arch::sycl_ops::linear(p_gk.values, qk_dim, model_dim, sc.x, p_bgk.values);
+                            sc.k = arch::activation::swiglu(sc.zk, sc.gk);
+
+                            sc.zv = arch::sycl_ops::linear(p_pv.values, v_dim, model_dim, sc.x, p_bv.values);
+                            sc.gv = arch::sycl_ops::linear(p_gv.values, v_dim, model_dim, sc.x, p_bgv.values);
+                            sc.v = arch::activation::swiglu(sc.zv, sc.gv);
+
+                            for (size_t i = 0; i < qk_dim; ++i) {
+                                for (size_t j = 0; j < v_dim; ++j) {
+                                    const float updated = model.config().decay * static_cast<float>(recurrent_state[i][j])
+                                        + static_cast<float>(sc.k[i]) * static_cast<float>(sc.v[j]);
+                                    recurrent_state[i][j] = static_cast<Scalar>(updated);
+                                }
+                            }
+                            sc.retained_state = recurrent_state;
+
+                            sc.ret_raw.assign(v_dim, static_cast<Scalar>(0.0f));
+                            for (size_t j = 0; j < v_dim; ++j) {
+                                float acc = 0.0f;
+                                for (size_t i = 0; i < qk_dim; ++i) {
+                                    acc += static_cast<float>(sc.q[i]) * static_cast<float>(recurrent_state[i][j]);
+                                }
+                                sc.ret_raw[j] = static_cast<Scalar>(acc);
+                            }
+                            const arch::Vector ret_norm = arch::group_norm(sc.ret_raw);
+
+                            sc.state.assign(v_dim, static_cast<Scalar>(0.0f));
+                            for (size_t i = 0; i < v_dim; ++i) {
+                                sc.state[i] = static_cast<Scalar>(static_cast<float>(ret_norm[i]) + static_cast<float>(sc.v[i]));
+                            }
+
+                            sc.hidden_inputs.reserve(hidden.size());
+                            sc.hidden_preacts.reserve(hidden.size());
+                            sc.hstate = sc.state;
                             for (size_t hi = 0; hi < hidden.size(); ++hi) {
-                                hidden_inputs.push_back(hstate);
+                                sc.hidden_inputs.push_back(sc.hstate);
                                 arch::Vector hz = arch::sycl_ops::linear(
                                     p_hidden_w[hi].values,
                                     hidden[hi].out_dim,
                                     hidden[hi].in_dim,
-                                    hstate,
+                                    sc.hstate,
                                     p_hidden_b[hi].values);
-                                hidden_preacts.push_back(hz);
-                                hstate = arch::activation::swiglu(hz, hz);
+                                sc.hidden_preacts.push_back(hz);
+                                sc.hstate = arch::activation::swiglu(hz, hz);
                             }
 
-                            arch::Vector action_logits = arch::sycl_ops::linear(
-                                p_act_w.values, act_dim, v_dim, hstate, p_act_b.values);
-                            arch::Vector raw_logits = arch::sycl_ops::linear(
-                                p_out_w.values, out_dim, v_dim, hstate, p_out_b.values);
-                            arch::Vector logits = arch::activation::param_tanh(raw_logits, p_theta.values[0]);
+                            sc.action_logits = arch::sycl_ops::linear(
+                                p_act_w.values, act_dim, v_dim, sc.hstate, p_act_b.values);
+                            {
+                                const arch::Vector load_logits = arch::sycl_ops::linear(
+                                    p_load_w.values, 1, load_in, sc.hstate, p_load_b.values);
+                                sc.load_logit = load_logits.empty() ? static_cast<Scalar>(0.0f) : load_logits[0];
+                            }
+                            sc.raw_logits = arch::sycl_ops::linear(
+                                p_out_w.values, out_dim, v_dim, sc.hstate, p_out_b.values);
+                            sc.logits = arch::activation::param_tanh(sc.raw_logits, p_theta.values[0]);
 
                             float out_ce = 0.0f;
-                            arch::Vector d_logits = softmax_ce_grad_from_logits(
-                                logits,
-                                static_cast<size_t>(static_cast<uint8_t>(ex.target[t])),
+                            (void)softmax_ce_grad_from_logits(
+                                sc.logits,
+                                static_cast<size_t>(sc.target),
                                 out_ce);
                             if (!std::isfinite(out_ce)) {
                                 ++nonfinite_skips;
-                                continue;
+                                sequence_valid = false;
+                                break;
                             }
                             epoch_loss_acc += out_ce;
+                            ++objective_evals;
 
-                            const auto tanh_grad = arch::activation::dparam_tanh(raw_logits, p_theta.values[0], d_logits);
+                            caches.push_back(std::move(sc));
+                        }
+
+                        if (!sequence_valid || caches.empty()) {
+                            continue;
+                        }
+
+                        arch::KVState d_retained_next(qk_dim, arch::Vector(v_dim, static_cast<Scalar>(0.0f)));
+                        for (size_t tr = caches.size(); tr-- > 0;) {
+                            const StepCache& sc = caches[tr];
+
+                            float out_ce = 0.0f;
+                            arch::Vector d_logits = softmax_ce_grad_from_logits(
+                                sc.logits,
+                                static_cast<size_t>(sc.target),
+                                out_ce);
+                            const auto tanh_grad = arch::activation::dparam_tanh(sc.raw_logits, p_theta.values[0], d_logits);
 
                             arch::Vector d_hstate(v_dim, static_cast<Scalar>(0.0f));
                             linear_backward(
-                                p_out_w.values, out_dim, v_dim, hstate, tanh_grad.dx,
+                                p_out_w.values, out_dim, v_dim, sc.hstate, tanh_grad.dx,
                                 p_out_w.grads, p_out_b.grads, d_hstate);
                             p_theta.grads[0] = static_cast<Scalar>(
                                 static_cast<float>(p_theta.grads[0]) + static_cast<float>(tanh_grad.dtheta));
 
-                            float action_ce = 0.0f;
-                            arch::Vector d_action = softmax_ce_grad_from_logits(
-                                action_logits,
-                                static_cast<size_t>(llm::arch::ModelAction::OUTPUT),
-                                action_ce);
-                            if (std::isfinite(action_ce)) {
-                                epoch_loss_acc += cfg_.loop_supervision_weight * action_ce;
-                                for (size_t i = 0; i < d_action.size(); ++i) {
-                                    d_action[i] = static_cast<Scalar>(
-                                        static_cast<float>(d_action[i]) * cfg_.loop_supervision_weight);
+                            if (cfg_.backprop_include_loop_supervision) {
+                                const size_t target_action = (tr + 1 < caches.size())
+                                    ? action_supervision_target_from_logits(
+                                        sc.logits,
+                                        caches[tr + 1].logits,
+                                        static_cast<uint8_t>(sc.target),
+                                        cfg_.enable_query,
+                                        tr)
+                                    : static_cast<size_t>(llm::arch::ModelAction::OUTPUT);
+
+                                float action_ce = 0.0f;
+                                arch::Vector d_action = softmax_ce_grad_from_logits(
+                                    sc.action_logits,
+                                    target_action,
+                                    action_ce);
+                                if (std::isfinite(action_ce)) {
+                                    epoch_loss_acc += cfg_.loop_supervision_weight * action_ce;
+                                    for (size_t i = 0; i < d_action.size(); ++i) {
+                                        d_action[i] = static_cast<Scalar>(
+                                            static_cast<float>(d_action[i]) * cfg_.loop_supervision_weight);
+                                    }
+                                    arch::Vector d_hstate_action(v_dim, static_cast<Scalar>(0.0f));
+                                    linear_backward(
+                                        p_act_w.values, act_dim, v_dim, sc.hstate, d_action,
+                                        p_act_w.grads, p_act_b.grads, d_hstate_action);
+                                    for (size_t i = 0; i < v_dim; ++i) {
+                                        d_hstate[i] = static_cast<Scalar>(
+                                            static_cast<float>(d_hstate[i]) + static_cast<float>(d_hstate_action[i]));
+                                    }
                                 }
-                                arch::Vector d_hstate_action(v_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(
-                                    p_act_w.values, act_dim, v_dim, hstate, d_action,
-                                    p_act_w.grads, p_act_b.grads, d_hstate_action);
-                                for (size_t i = 0; i < v_dim; ++i) {
-                                    d_hstate[i] = static_cast<Scalar>(
-                                        static_cast<float>(d_hstate[i]) + static_cast<float>(d_hstate_action[i]));
+
+                                if (cfg_.enable_query) {
+                                    const float target_load = (target_action == static_cast<size_t>(llm::arch::ModelAction::QUERY_MEMORY))
+                                        ? 1.0f
+                                        : 0.0f;
+                                    const auto [load_ce, d_load] = binary_ce_and_grad(
+                                        static_cast<float>(sc.load_logit),
+                                        target_load);
+                                    if (std::isfinite(load_ce) && std::isfinite(d_load)) {
+                                        epoch_loss_acc += cfg_.load_gate_supervision_weight * load_ce;
+                                        const float d = cfg_.load_gate_supervision_weight * d_load;
+                                        p_load_b.grads[0] = static_cast<Scalar>(
+                                            static_cast<float>(p_load_b.grads[0]) + d);
+                                        for (size_t i = 0; i < load_in; ++i) {
+                                            p_load_w.grads[i] = static_cast<Scalar>(
+                                                static_cast<float>(p_load_w.grads[i]) + d * static_cast<float>(sc.hstate[i]));
+                                        }
+                                    }
                                 }
                             }
 
-                            // Hidden stack backward.
                             for (size_t hri = hidden.size(); hri-- > 0;) {
                                 const arch::Vector dself = d_hstate;
-                                const auto g = arch::activation::dswiglu(hidden_preacts[hri], hidden_preacts[hri], dself);
-                                arch::Vector dz(hidden_preacts[hri].size(), static_cast<Scalar>(0.0f));
+                                const auto g = arch::activation::dswiglu(sc.hidden_preacts[hri], sc.hidden_preacts[hri], dself);
+                                arch::Vector dz(sc.hidden_preacts[hri].size(), static_cast<Scalar>(0.0f));
                                 for (size_t i = 0; i < dz.size(); ++i) {
                                     dz[i] = static_cast<Scalar>(
                                         static_cast<float>(g.dx[i]) + static_cast<float>(g.dgate[i]));
                                 }
-                                arch::Vector dprev(hidden_inputs[hri].size(), static_cast<Scalar>(0.0f));
+                                arch::Vector dprev(sc.hidden_inputs[hri].size(), static_cast<Scalar>(0.0f));
                                 linear_backward(
                                     p_hidden_w[hri].values,
                                     hidden[hri].out_dim,
                                     hidden[hri].in_dim,
-                                    hidden_inputs[hri],
+                                    sc.hidden_inputs[hri],
                                     dz,
                                     p_hidden_w[hri].grads,
                                     p_hidden_b[hri].grads,
@@ -1208,7 +1498,6 @@ public:
                                 d_hstate = std::move(dprev);
                             }
 
-                            // Backward through state = ret + v
                             arch::Vector d_ret = d_hstate;
                             arch::Vector d_v(v_dim, static_cast<Scalar>(0.0f));
                             for (size_t i = 0; i < v_dim; ++i) {
@@ -1216,80 +1505,87 @@ public:
                                     static_cast<float>(d_v[i]) + static_cast<float>(d_hstate[i]));
                             }
 
-                            // ret = group_norm(y), y = alpha * v
-                            const arch::Vector d_y = dgroup_norm(y, d_ret);
-                            float d_alpha = 0.0f;
-                            for (size_t i = 0; i < v_dim; ++i) {
-                                const float gy = static_cast<float>(d_y[i]);
-                                d_alpha += gy * static_cast<float>(v[i]);
-                                d_v[i] = static_cast<Scalar>(
-                                    static_cast<float>(d_v[i]) + gy * alpha);
-                            }
+                            const arch::Vector d_ret_raw = dgroup_norm(sc.ret_raw, d_ret);
 
                             arch::Vector d_q(qk_dim, static_cast<Scalar>(0.0f));
                             arch::Vector d_k(qk_dim, static_cast<Scalar>(0.0f));
-                            for (size_t i = 0; i < qk_dim; ++i) {
-                                d_q[i] = static_cast<Scalar>(d_alpha * static_cast<float>(k[i]));
-                                d_k[i] = static_cast<Scalar>(d_alpha * static_cast<float>(q[i]));
-                            }
+                            arch::KVState d_retained_cur = d_retained_next;
 
-                            const auto gq_bw = arch::activation::dswiglu(zq, gq, d_q);
-                            const auto gk_bw = arch::activation::dswiglu(zk, gk, d_k);
-                            const auto gv_bw = arch::activation::dswiglu(zv, gv, d_v);
+                            for (size_t i = 0; i < qk_dim; ++i) {
+                                float dq_i = 0.0f;
+                                for (size_t j = 0; j < v_dim; ++j) {
+                                    dq_i += static_cast<float>(d_ret_raw[j])
+                                        * static_cast<float>(sc.retained_state[i][j]);
+
+                                    const float ds = static_cast<float>(d_retained_cur[i][j])
+                                        + static_cast<float>(sc.q[i]) * static_cast<float>(d_ret_raw[j]);
+
+                                    d_k[i] = static_cast<Scalar>(
+                                        static_cast<float>(d_k[i]) + ds * static_cast<float>(sc.v[j]));
+                                    d_v[j] = static_cast<Scalar>(
+                                        static_cast<float>(d_v[j]) + ds * static_cast<float>(sc.k[i]));
+                                    d_retained_cur[i][j] = static_cast<Scalar>(model.config().decay * ds);
+                                }
+                                d_q[i] = static_cast<Scalar>(dq_i);
+                            }
+                            d_retained_next = std::move(d_retained_cur);
+
+                            const auto gq_bw = arch::activation::dswiglu(sc.zq, sc.gq, d_q);
+                            const auto gk_bw = arch::activation::dswiglu(sc.zk, sc.gk, d_k);
+                            const auto gv_bw = arch::activation::dswiglu(sc.zv, sc.gv, d_v);
 
                             arch::Vector d_x(model_dim, static_cast<Scalar>(0.0f));
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_pq.values, qk_dim, model_dim, x, gq_bw.dx, p_pq.grads, p_bq.grads, tdx);
+                                linear_backward(p_pq.values, qk_dim, model_dim, sc.x, gq_bw.dx, p_pq.grads, p_bq.grads, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_gq.values, qk_dim, model_dim, x, gq_bw.dgate, p_gq.grads, p_bgq.grads, tdx);
+                                linear_backward(p_gq.values, qk_dim, model_dim, sc.x, gq_bw.dgate, p_gq.grads, p_bgq.grads, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_pk.values, qk_dim, model_dim, x, gk_bw.dx, p_pk.grads, p_bk.grads, tdx);
+                                linear_backward(p_pk.values, qk_dim, model_dim, sc.x, gk_bw.dx, p_pk.grads, p_bk.grads, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_gk.values, qk_dim, model_dim, x, gk_bw.dgate, p_gk.grads, p_bgk.grads, tdx);
+                                linear_backward(p_gk.values, qk_dim, model_dim, sc.x, gk_bw.dgate, p_gk.grads, p_bgk.grads, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_pv.values, v_dim, model_dim, x, gv_bw.dx, p_pv.grads, p_bv.grads, tdx);
+                                linear_backward(p_pv.values, v_dim, model_dim, sc.x, gv_bw.dx, p_pv.grads, p_bv.grads, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_gv.values, v_dim, model_dim, x, gv_bw.dgate, p_gv.grads, p_bgv.grads, tdx);
+                                linear_backward(p_gv.values, v_dim, model_dim, sc.x, gv_bw.dgate, p_gv.grads, p_bgv.grads, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
 
                             for (size_t i = 0; i < model_dim; ++i) {
-                                p_embed.grads[emb_off + i] = static_cast<Scalar>(
-                                    static_cast<float>(p_embed.grads[emb_off + i]) + static_cast<float>(d_x[i]));
+                                p_embed.grads[sc.emb_off + i] = static_cast<Scalar>(
+                                    static_cast<float>(p_embed.grads[sc.emb_off + i]) + static_cast<float>(d_x[i]));
                             }
-
-                            ++batch_tokens;
-                            ++epoch_token_count;
-                            ++objective_evals;
                         }
+
+                        batch_tokens += caches.size();
+                        epoch_token_count += caches.size();
                         ++epoch_example_count;
                     }
 
@@ -1313,6 +1609,7 @@ public:
                         scale_grads(p_hidden_b[hi].grads);
                     }
                     scale_grads(p_out_w.grads); scale_grads(p_out_b.grads); scale_grads(p_act_w.grads); scale_grads(p_act_b.grads);
+                    scale_grads(p_load_w.grads); scale_grads(p_load_b.grads);
                     p_theta.grads[0] = static_cast<Scalar>(static_cast<float>(p_theta.grads[0]) * inv);
 
                     std::vector<ParameterTensor> params;
@@ -1326,6 +1623,7 @@ public:
                     }
                     params.push_back(p_out_w); params.push_back(p_out_b);
                     params.push_back(p_act_w); params.push_back(p_act_b);
+                    params.push_back(p_load_w); params.push_back(p_load_b);
                     params.push_back(p_theta);
 
                     optimizer.step(params);
@@ -1341,6 +1639,7 @@ public:
                     }
                     p_out_w = params[pi++]; p_out_b = params[pi++];
                     p_act_w = params[pi++]; p_act_b = params[pi++];
+                    p_load_w = params[pi++]; p_load_b = params[pi++];
                     p_theta = params[pi++];
 
                     // write back with finite guards
@@ -1370,6 +1669,8 @@ public:
                     out_b = p_out_b.values; clamp_vec(out_b);
                     act_w = p_act_w.values; clamp_vec(act_w);
                     act_b = p_act_b.values; clamp_vec(act_b);
+                    load_w = p_load_w.values; clamp_vec(load_w);
+                    load_b = p_load_b.values; clamp_vec(load_b);
                     {
                         const float th = static_cast<float>(p_theta.values[0]);
                         if (std::isfinite(th)) {
@@ -1378,6 +1679,11 @@ public:
                             ++repaired;
                         }
                     }
+                    maybe_print(epoch_token_count > 0
+                        ? epoch_loss_acc / static_cast<float>(epoch_token_count)
+                        : 0.0f,
+                        std::min(batch_start + cfg_.batch_size, epoch_dataset.size()),
+                        epoch_dataset.size());
                 }
 
                 const auto bp_t1 = std::chrono::steady_clock::now();
@@ -1442,49 +1748,9 @@ public:
                     }
                 }
             }
-
-            const auto epoch_t1 = std::chrono::steady_clock::now();
-            const double epoch_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(epoch_t1 - epoch_t0).count();
-            const double epoch_s = std::max(1e-6, epoch_ms / 1000.0);
-            const double tokens_per_sec = static_cast<double>(epoch_token_count) / epoch_s;
-            const double examples_per_sec = static_cast<double>(epoch_example_count) / epoch_s;
-            const uint64_t kernel_launches = llm::arch::sycl_ops::kernel_launch_count();
-            const float gradcheck_rel_err = (gradcheck_count == 0)
-                ? 0.0f
-                : (gradcheck_rel_err_sum / static_cast<float>(gradcheck_count));
-
-            const char* mode_name = (cfg_.mode == TrainMode::FiniteDifference)
-                ? "FD"
-                : (cfg_.mode == TrainMode::BackpropHeads ? "BP_HEADS" : "BP_FULL");
-
-            std::cout << "Epoch " << (epoch + 1) << "/" << cfg_.epochs
-                      << " - Mode: " << mode_name
-                      << " - LR: " << lr_epoch
-                      << " - BaseLR: " << base_lr_epoch
-                      << " - LRScale: " << lr_multiplier
-                      << " - FDsamples: " << grad_samples_epoch
-                      << " - Loss: " << epoch_loss
-                      << " - LossDelta: " << loss_delta
-                      << " - LossEMA: " << loss_ema
-                      << " - FDms: " << fd_ms
-                      << " - SeqMs: " << seq_forward_ms
-                      << " - ObjEvals: " << objective_evals
-                      << " - QueryEvents: " << query_events
-                      << " - EpochMs: " << epoch_ms
-                      << " - Tok/s: " << tokens_per_sec
-                      << " - Ex/s: " << examples_per_sec
-                      << " - Kernels: " << kernel_launches
-                      << " - GradCheckRelErr: " << gradcheck_rel_err
-                      << " - ActiveGrad%: " << (100.0f * active_grad_fraction)
-                      << " - NonFiniteSkips: " << nonfinite_skips
-                      << " - Skip%: " << (100.0f * nonfinite_skip_ratio);
-            if (repaired > 0) {
-                std::cout << " - Repaired: " << repaired;
-            }
-            if (unstable_epoch) {
-                std::cout << " - LRBackoff";
-            }
-            std::cout << "\n";
+            inter_loss_delta = loss_delta;
+            inter_unstable = unstable_epoch;
+            maybe_print(epoch_loss, epoch_dataset.size(), epoch_dataset.size());
         }
 
         return history;

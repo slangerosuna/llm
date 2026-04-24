@@ -46,7 +46,7 @@ int main() {
     train_cfg.loop_supervision_weight = 0.1f;
     train_cfg.enable_query = false;
     train_cfg.force_output = true;
-    train_cfg.use_parallel_retention = false;
+    train_cfg.use_parallel_retention = true;
     train_cfg.forced_loop_min = 1;
     train_cfg.forced_loop_max = 1;
     train_cfg.seed = 13;

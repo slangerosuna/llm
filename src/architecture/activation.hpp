@@ -132,7 +132,9 @@ inline SwiGLUGrad dswiglu(
 	return grad;
 }
 
-// ParamTanh(x; theta, eps) = tanh((softplus(theta) + eps) * x)
+// Learned output-logit scaling. Using a saturating tanh on logits makes
+// high-frequency characters like space an easy collapse target, so keep the
+// trainable gain but leave logits unsquashed for CE/argmax.
 inline Vector param_tanh(const Vector& x, Scalar theta, Scalar epsilon = static_cast<Scalar>(1e-6f)) {
 	const float a = static_cast<float>(softplus(theta)) + static_cast<float>(epsilon);
 	Vector out(x.size(), static_cast<Scalar>(0.0f));
@@ -140,7 +142,7 @@ inline Vector param_tanh(const Vector& x, Scalar theta, Scalar epsilon = static_
 	if (!sycl_ops::use_sycl_kernels()) {
 	for (size_t i = 0; i < x.size(); ++i) {
 		const float xv = static_cast<float>(x[i]);
-		out[i] = static_cast<Scalar>(std::tanh(a * xv));
+		out[i] = static_cast<Scalar>(a * xv);
 	}
 	return out;
 }
@@ -152,7 +154,7 @@ inline Vector param_tanh(const Vector& x, Scalar theta, Scalar epsilon = static_
 		auto o_acc = o_buf.get_access<sycl::access::mode::discard_write>(h);
 		h.parallel_for(sycl::range<1>(x.size()), [=](sycl::id<1> i) {
 			const float xv = static_cast<float>(x_acc[i]);
-			o_acc[i] = static_cast<Scalar>(sycl::tanh(a * xv));
+			o_acc[i] = static_cast<Scalar>(a * xv);
 		});
 	});
 	sycl_ops::default_queue().wait();
@@ -185,10 +187,8 @@ inline ParamTanhGrad dparam_tanh(
 	for (size_t i = 0; i < x.size(); ++i) {
 		const float xv = static_cast<float>(x[i]);
 		const float dv = static_cast<float>(dout[i]);
-		const float t = std::tanh(a * xv);
-		const float sech2 = 1.0f - t * t;
-		dx[i] = static_cast<Scalar>(dv * sech2 * a);
-		dtheta += dv * sech2 * xv * da_dtheta;
+		dx[i] = static_cast<Scalar>(dv * a);
+		dtheta += dv * xv * da_dtheta;
 	}
 	return ParamTanhGrad{std::move(dx), static_cast<Scalar>(dtheta)};
 }
@@ -208,10 +208,8 @@ inline ParamTanhGrad dparam_tanh(
 		h.parallel_for(sycl::range<1>(x.size()), dtheta_sum, [=](sycl::id<1> i, auto& sum) {
 			const float xv = static_cast<float>(x_acc[i]);
 			const float dv = static_cast<float>(d_acc[i]);
-			const float t = sycl::tanh(a * xv);
-			const float sech2 = 1.0f - t * t;
-			dx_acc[i] = static_cast<Scalar>(dv * sech2 * a);
-			sum += dv * sech2 * xv * da_dtheta;
+			dx_acc[i] = static_cast<Scalar>(dv * a);
+			sum += dv * xv * da_dtheta;
 		});
 	});
 	q.wait();

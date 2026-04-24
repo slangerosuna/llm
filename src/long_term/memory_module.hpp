@@ -183,7 +183,11 @@ public:
             SemVec to_sv   = compressor_.compress(mem.values[i]);
 
             const size_t from_id = find_or_create_node(from_sv);
-            const size_t to_id   = find_or_create_node(to_sv);
+            // If key and value compress to nearby semantics, treat them as the
+            // same underlying node for insertion-time merging.
+            const size_t to_id = (semvec_l2sq(from_sv, to_sv) < cfg_.merge_threshold_sq)
+                ? from_id
+                : find_or_create_node(to_sv);
 
             // Copy rel_sv as edge label (Graph takes SemVec by move).
             SemVec edge_rel(rel_sv.dimensions);

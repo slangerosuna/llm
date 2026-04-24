@@ -102,6 +102,9 @@ class LoopingRetNet {
     // 3-class action head.
     LinearProj action_head_; // v_dim → 3
 
+    // Query-load gate head.
+    LinearProj load_head_; // v_dim → 1
+
     // Character output head.
     LinearProj output_head_; // v_dim → char_vocab
     Scalar output_theta_ = static_cast<Scalar>(1.0f);
@@ -109,7 +112,7 @@ class LoopingRetNet {
     Attention attention_;
 
     static constexpr uint32_t kModelMagic = 0x4C524E54; // "LRNT"
-    static constexpr uint32_t kModelVersion = 2;
+    static constexpr uint32_t kModelVersion = 3;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -290,6 +293,7 @@ public:
             hidden_layers_.emplace_back(cfg.v_dim, cfg.v_dim, s, rng);
         }
         action_head_= LinearProj(cfg.v_dim,     3,             s, rng);
+        load_head_  = LinearProj(cfg.v_dim,     1,             s, rng);
         output_head_= LinearProj(cfg.v_dim,     cfg.char_vocab, s, rng);
         output_theta_ = static_cast<Scalar>(1.0f);
     }
@@ -335,6 +339,7 @@ public:
             write_linear(os, layer);
         }
         write_linear(os, action_head_);
+        write_linear(os, load_head_);
         write_linear(os, output_head_);
         os.write(reinterpret_cast<const char*>(&output_theta_), sizeof(output_theta_));
 
@@ -354,7 +359,7 @@ public:
         if (magic != kModelMagic) {
             throw std::runtime_error("LoopingRetNet load: invalid file magic");
         }
-        if (version != 1 && version != kModelVersion) {
+        if (version != 1 && version != 2 && version != kModelVersion) {
             throw std::runtime_error("LoopingRetNet load: unsupported version");
         }
 
@@ -400,6 +405,14 @@ public:
             model.cfg_.hidden_layers = 0;
         }
         model.action_head_ = read_linear(is);
+        if (version >= 3) {
+            model.load_head_ = read_linear(is);
+        } else {
+            model.load_head_.in_dim = cfg.v_dim;
+            model.load_head_.out_dim = 1;
+            model.load_head_.w.assign(cfg.v_dim, static_cast<Scalar>(0.0f));
+            model.load_head_.b.assign(1, static_cast<Scalar>(4.0f));
+        }
         model.output_head_ = read_linear(is);
         is.read(reinterpret_cast<char*>(&model.output_theta_), sizeof(model.output_theta_));
 
@@ -437,6 +450,7 @@ public:
             h = hash_linear(h, layer);
         }
         h = hash_linear(h, action_head_);
+        h = hash_linear(h, load_head_);
         h = hash_linear(h, output_head_);
         h = fnv1a_u64(h, static_cast<uint64_t>(static_cast<float>(output_theta_) * 1000000.0f));
         return h;
@@ -462,6 +476,7 @@ public:
             total += l.w.size() + l.b.size();
         }
         total += action_head_.w.size() + action_head_.b.size();
+        total += load_head_.w.size() + load_head_.b.size();
         total += output_head_.w.size() + output_head_.b.size();
         total += 1;
 
@@ -488,6 +503,7 @@ public:
             append_linear(l);
         }
         append_linear(action_head_);
+        append_linear(load_head_);
         append_linear(output_head_);
         flat.push_back(output_theta_);
 
@@ -526,6 +542,7 @@ public:
             append_linear(l);
         }
         append_linear(action_head_);
+        append_linear(load_head_);
         append_linear(output_head_);
 
         refs.push_back(&output_theta_);
@@ -555,6 +572,7 @@ public:
             add_linear(l);
         }
         add_linear(action_head_);
+        add_linear(load_head_);
         add_linear(output_head_);
         return total;
     }
@@ -594,6 +612,7 @@ public:
             load_linear(l);
         }
         load_linear(action_head_);
+        load_linear(load_head_);
         load_linear(output_head_);
 
         if (idx + 1 > flat.size()) {
@@ -623,6 +642,8 @@ public:
         std::vector<Vector> per_step_output_logits;
         std::vector<Vector> per_step_action_logits;
         std::vector<Vector> per_step_states;
+        std::vector<Scalar> per_step_load_logits;
+        std::vector<uint8_t> per_step_query_hits;
     };
 
     // Processes one input character token.
@@ -644,7 +665,8 @@ public:
         bool                      enable_query = true,
         size_t                    forced_loop_count = 0,
         bool                      use_parallel_retention = false,
-        bool                      enable_memory_write = true)
+        bool                      enable_memory_write = true,
+        bool                      force_query_first = false)
     {
         // x starts as the character embedding and may be overridden to the
         // fused-state loop projection on subsequent inner steps.
@@ -657,6 +679,8 @@ public:
         std::vector<Vector> all_output_logits;
         std::vector<Vector> all_action_logits;
         std::vector<Vector> all_states;
+        std::vector<Scalar> all_load_logits;
+        std::vector<uint8_t> all_query_hits;
 
         const size_t forced_loops = (forced_loop_count == 0)
             ? 0
@@ -715,10 +739,15 @@ public:
             // ── Action decision ───────────────────────────────────────────
             const bool last_step = (step_i == cfg_.max_steps - 1);
             Vector action_logits = action_head_.forward(state);
+            const Vector load_logits = load_head_.forward(state);
+            const float load_logit = load_logits.empty() ? 0.0f : static_cast<float>(load_logits[0]);
             ModelAction action = force_output ? ModelAction::OUTPUT : pick_action(state);
 
             if (forced_loops > 0) {
                 action = (step_i + 1 < forced_loops) ? ModelAction::LOOP : ModelAction::OUTPUT;
+            }
+            if (!force_output && force_query_first && enable_query && step_i == 0 && !last_step) {
+                action = ModelAction::QUERY_MEMORY;
             }
 
             const Vector raw_logits = output_head_.forward(state);
@@ -726,6 +755,8 @@ public:
             all_output_logits.push_back(logits);
             all_action_logits.push_back(action_logits);
             all_states.push_back(state);
+            all_load_logits.push_back(static_cast<Scalar>(load_logit));
+            all_query_hits.push_back(0);
 
             // Force output on the last step to guarantee termination.
             if (last_step) { action = ModelAction::OUTPUT; }
@@ -734,14 +765,20 @@ public:
                 // Multihop graph query; add results to kv_cache with penalty.
                 AttentionMemory queried = query_engine.query(q);
                 ++query_count;
-                for (size_t qi = 0; qi < queried.size(); ++qi) {
-                    kv_cache.push_back(
-                        std::move(queried.keys[qi]),
-                        std::move(queried.relations[qi]),
-                        std::move(queried.values[qi]),
-                        queried.prune_scores[qi]);
+                if (!queried.empty()) {
+                    all_query_hits.back() = 1;
                 }
-                kv_cache.prune_to_max(kv_cache_limit());
+                const float load_prob = 1.0f / (1.0f + std::exp(-load_logit));
+                if (load_prob >= 0.5f) {
+                    for (size_t qi = 0; qi < queried.size(); ++qi) {
+                        kv_cache.push_back(
+                            std::move(queried.keys[qi]),
+                            std::move(queried.relations[qi]),
+                            std::move(queried.values[qi]),
+                            queried.prune_scores[qi]);
+                    }
+                    kv_cache.prune_to_max(kv_cache_limit());
+                }
                 // Loop again using the fused state projected back to model_dim.
                 x = activation::swiglu(loop_proj_.forward(state), loop_proj_.forward(state));
                 continue;
@@ -764,6 +801,8 @@ public:
             trace.per_step_output_logits = std::move(all_output_logits);
             trace.per_step_action_logits = std::move(all_action_logits);
             trace.per_step_states = std::move(all_states);
+            trace.per_step_load_logits = std::move(all_load_logits);
+            trace.per_step_query_hits = std::move(all_query_hits);
             return trace;
         }
 
@@ -785,7 +824,11 @@ public:
             bridge,
             query_engine,
             false,
-            true);
+            true,
+            0,
+            false,
+            true,
+            false);
         return {t.output_char, t.inner_steps_taken};
     }
 
@@ -843,6 +886,26 @@ public:
 
     const std::vector<Scalar>& action_head_bias() const {
         return action_head_.b;
+    }
+
+    size_t load_gate_input_dim() const {
+        return load_head_.in_dim;
+    }
+
+    std::vector<Scalar>& load_gate_weights() {
+        return load_head_.w;
+    }
+
+    std::vector<Scalar>& load_gate_bias() {
+        return load_head_.b;
+    }
+
+    const std::vector<Scalar>& load_gate_weights() const {
+        return load_head_.w;
+    }
+
+    const std::vector<Scalar>& load_gate_bias() const {
+        return load_head_.b;
     }
 
     size_t hidden_layer_count() const {
