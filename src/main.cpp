@@ -726,7 +726,8 @@ int run_infer_command(const ParsedArgs& args) {
         0,
         use_parallel_retention,
         true);
-    current = step.output_char;
+    (void)step;
+    current = c;
   }
 
   std::string generated;
