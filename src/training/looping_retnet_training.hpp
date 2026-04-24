@@ -1592,16 +1592,73 @@ public:
                     ParameterTensor p_load_w{load_w, std::vector<Scalar>(load_w.size(), static_cast<Scalar>(0.0f))};
                     ParameterTensor p_load_b{load_b, std::vector<Scalar>(load_b.size(), static_cast<Scalar>(0.0f))};
 
-                    size_t batch_tokens = 0;
+                    const size_t batch_examples = batch_end - batch_start;
+                    const bool use_parallel_examples = (effective_host_threads() > 1)
+                        && (batch_examples >= cfg_.min_parallel_batch_examples);
+                    const size_t example_threads = use_parallel_examples
+                        ? std::min(effective_host_threads(), batch_examples)
+                        : 1;
 
-                    for (size_t exi = batch_start; exi < batch_end; ++exi) {
+                    size_t batch_tokens = 0;
+                    std::mutex accum_mutex;
+                    auto add_grad_vec = [](std::vector<Scalar>& dst, const std::vector<Scalar>& src) {
+                        if (dst.size() != src.size()) {
+                            return;
+                        }
+                        for (size_t i = 0; i < dst.size(); ++i) {
+                            dst[i] = static_cast<Scalar>(
+                                static_cast<float>(dst[i]) + static_cast<float>(src[i]));
+                        }
+                    };
+
+                    parallel_for_ranges(
+                        batch_start,
+                        batch_end,
+                        example_threads,
+                        [&](size_t ex_begin, size_t ex_end, size_t /*worker_id*/) {
+                        std::vector<Scalar> lg_embed(p_embed.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_pq(p_pq.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_bq(p_bq.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_gq(p_gq.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_bgq(p_bgq.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_pk(p_pk.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_bk(p_bk.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_gk(p_gk.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_bgk(p_bgk.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_pv(p_pv.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_bv(p_bv.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_gv(p_gv.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_bgv(p_bgv.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<std::vector<Scalar>> lg_hidden_w(hidden.size());
+                        std::vector<std::vector<Scalar>> lg_hidden_b(hidden.size());
+                        for (size_t hi = 0; hi < hidden.size(); ++hi) {
+                            lg_hidden_w[hi].assign(p_hidden_w[hi].grads.size(), static_cast<Scalar>(0.0f));
+                            lg_hidden_b[hi].assign(p_hidden_b[hi].grads.size(), static_cast<Scalar>(0.0f));
+                        }
+                        std::vector<Scalar> lg_out_w(p_out_w.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_out_b(p_out_b.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_act_w(p_act_w.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_act_b(p_act_b.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_load_w(p_load_w.grads.size(), static_cast<Scalar>(0.0f));
+                        std::vector<Scalar> lg_load_b(p_load_b.grads.size(), static_cast<Scalar>(0.0f));
+                        Scalar lg_theta = static_cast<Scalar>(0.0f);
+
+                        float local_epoch_loss_acc = 0.0f;
+                        size_t local_batch_tokens = 0;
+                        size_t local_epoch_tokens = 0;
+                        size_t local_epoch_examples = 0;
+                        size_t local_nonfinite_skips = 0;
+                        size_t local_objective_evals = 0;
+
+                        for (size_t exi = ex_begin; exi < ex_end; ++exi) {
                         const auto& ex = epoch_dataset[exi];
                         const size_t steps = std::min(ex.input.size(), ex.target.size());
                         if (steps == 0) {
                             continue;
                         }
+                        std::mt19937 ex_rng(per_example_seed(cfg_.seed, epoch + 1, batch_start, exi));
                         std::uniform_int_distribution<size_t> start_dist(0, steps - 1);
-                        const size_t start = start_dist(rng);
+                        const size_t start = start_dist(ex_rng);
 
                         struct StepCache {
                             size_t emb_off = 0;
@@ -1704,12 +1761,12 @@ public:
                                 static_cast<size_t>(sc.target),
                                 out_ce);
                             if (!std::isfinite(out_ce)) {
-                                ++nonfinite_skips;
+                                ++local_nonfinite_skips;
                                 sequence_valid = false;
                                 break;
                             }
-                            epoch_loss_acc += out_ce;
-                            ++objective_evals;
+                            local_epoch_loss_acc += out_ce;
+                            ++local_objective_evals;
 
                             caches.push_back(std::move(sc));
                         }
@@ -1769,9 +1826,9 @@ public:
                             arch::Vector d_hstate(v_dim, static_cast<Scalar>(0.0f));
                             linear_backward(
                                 p_out_w.values, out_dim, v_dim, sc.hstate, d_raw_combined,
-                                p_out_w.grads, p_out_b.grads, d_hstate);
-                            p_theta.grads[0] = static_cast<Scalar>(
-                                static_cast<float>(p_theta.grads[0]) + static_cast<float>(tanh_grad.dtheta));
+                                lg_out_w, lg_out_b, d_hstate);
+                            lg_theta = static_cast<Scalar>(
+                                static_cast<float>(lg_theta) + static_cast<float>(tanh_grad.dtheta));
 
                             if (cfg_.backprop_include_loop_supervision) {
                                 const size_t target_action = action_supervision_target_from_logits(
@@ -1794,7 +1851,7 @@ public:
                                     arch::Vector d_hstate_action(v_dim, static_cast<Scalar>(0.0f));
                                     linear_backward(
                                         p_act_w.values, act_dim, v_dim, sc.hstate, d_action,
-                                        p_act_w.grads, p_act_b.grads, d_hstate_action);
+                                        lg_act_w, lg_act_b, d_hstate_action);
                                     for (size_t i = 0; i < v_dim; ++i) {
                                         d_hstate[i] = static_cast<Scalar>(
                                             static_cast<float>(d_hstate[i]) + static_cast<float>(d_hstate_action[i]));
@@ -1811,11 +1868,11 @@ public:
                                     if (std::isfinite(load_ce) && std::isfinite(d_load)) {
                                         epoch_loss_acc += cfg_.load_gate_supervision_weight * load_ce;
                                         const float d = cfg_.load_gate_supervision_weight * d_load;
-                                        p_load_b.grads[0] = static_cast<Scalar>(
-                                            static_cast<float>(p_load_b.grads[0]) + d);
+                                        lg_load_b[0] = static_cast<Scalar>(
+                                            static_cast<float>(lg_load_b[0]) + d);
                                         for (size_t i = 0; i < load_in; ++i) {
-                                            p_load_w.grads[i] = static_cast<Scalar>(
-                                                static_cast<float>(p_load_w.grads[i]) + d * static_cast<float>(sc.hstate[i]));
+                                            lg_load_w[i] = static_cast<Scalar>(
+                                                static_cast<float>(lg_load_w[i]) + d * static_cast<float>(sc.hstate[i]));
                                         }
                                     }
                                 }
@@ -1836,8 +1893,8 @@ public:
                                     hidden[hri].in_dim,
                                     sc.hidden_inputs[hri],
                                     dz,
-                                    p_hidden_w[hri].grads,
-                                    p_hidden_b[hri].grads,
+                                    lg_hidden_w[hri],
+                                    lg_hidden_b[hri],
                                     dprev);
                                 d_hstate = std::move(dprev);
                             }
@@ -1881,57 +1938,92 @@ public:
                             arch::Vector d_x(model_dim, static_cast<Scalar>(0.0f));
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_pq.values, qk_dim, model_dim, sc.x, gq_bw.dx, p_pq.grads, p_bq.grads, tdx);
+                                linear_backward(p_pq.values, qk_dim, model_dim, sc.x, gq_bw.dx, lg_pq, lg_bq, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_gq.values, qk_dim, model_dim, sc.x, gq_bw.dgate, p_gq.grads, p_bgq.grads, tdx);
+                                linear_backward(p_gq.values, qk_dim, model_dim, sc.x, gq_bw.dgate, lg_gq, lg_bgq, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_pk.values, qk_dim, model_dim, sc.x, gk_bw.dx, p_pk.grads, p_bk.grads, tdx);
+                                linear_backward(p_pk.values, qk_dim, model_dim, sc.x, gk_bw.dx, lg_pk, lg_bk, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_gk.values, qk_dim, model_dim, sc.x, gk_bw.dgate, p_gk.grads, p_bgk.grads, tdx);
+                                linear_backward(p_gk.values, qk_dim, model_dim, sc.x, gk_bw.dgate, lg_gk, lg_bgk, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_pv.values, v_dim, model_dim, sc.x, gv_bw.dx, p_pv.grads, p_bv.grads, tdx);
+                                linear_backward(p_pv.values, v_dim, model_dim, sc.x, gv_bw.dx, lg_pv, lg_bv, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
                             {
                                 arch::Vector tdx(model_dim, static_cast<Scalar>(0.0f));
-                                linear_backward(p_gv.values, v_dim, model_dim, sc.x, gv_bw.dgate, p_gv.grads, p_bgv.grads, tdx);
+                                linear_backward(p_gv.values, v_dim, model_dim, sc.x, gv_bw.dgate, lg_gv, lg_bgv, tdx);
                                 for (size_t i = 0; i < model_dim; ++i) {
                                     d_x[i] = static_cast<Scalar>(static_cast<float>(d_x[i]) + static_cast<float>(tdx[i]));
                                 }
                             }
 
                             for (size_t i = 0; i < model_dim; ++i) {
-                                p_embed.grads[sc.emb_off + i] = static_cast<Scalar>(
-                                    static_cast<float>(p_embed.grads[sc.emb_off + i]) + static_cast<float>(d_x[i]));
+                                lg_embed[sc.emb_off + i] = static_cast<Scalar>(
+                                    static_cast<float>(lg_embed[sc.emb_off + i]) + static_cast<float>(d_x[i]));
                             }
                         }
 
-                        batch_tokens += caches.size();
-                        epoch_token_count += caches.size();
-                        ++epoch_example_count;
-                    }
+                        local_batch_tokens += caches.size();
+                        local_epoch_tokens += caches.size();
+                        ++local_epoch_examples;
+                        }
+
+                        std::lock_guard<std::mutex> lock(accum_mutex);
+                        add_grad_vec(p_embed.grads, lg_embed);
+                        add_grad_vec(p_pq.grads, lg_pq);
+                        add_grad_vec(p_bq.grads, lg_bq);
+                        add_grad_vec(p_gq.grads, lg_gq);
+                        add_grad_vec(p_bgq.grads, lg_bgq);
+                        add_grad_vec(p_pk.grads, lg_pk);
+                        add_grad_vec(p_bk.grads, lg_bk);
+                        add_grad_vec(p_gk.grads, lg_gk);
+                        add_grad_vec(p_bgk.grads, lg_bgk);
+                        add_grad_vec(p_pv.grads, lg_pv);
+                        add_grad_vec(p_bv.grads, lg_bv);
+                        add_grad_vec(p_gv.grads, lg_gv);
+                        add_grad_vec(p_bgv.grads, lg_bgv);
+                        for (size_t hi = 0; hi < hidden.size(); ++hi) {
+                            add_grad_vec(p_hidden_w[hi].grads, lg_hidden_w[hi]);
+                            add_grad_vec(p_hidden_b[hi].grads, lg_hidden_b[hi]);
+                        }
+                        add_grad_vec(p_out_w.grads, lg_out_w);
+                        add_grad_vec(p_out_b.grads, lg_out_b);
+                        add_grad_vec(p_act_w.grads, lg_act_w);
+                        add_grad_vec(p_act_b.grads, lg_act_b);
+                        add_grad_vec(p_load_w.grads, lg_load_w);
+                        add_grad_vec(p_load_b.grads, lg_load_b);
+                        p_theta.grads[0] = static_cast<Scalar>(
+                            static_cast<float>(p_theta.grads[0]) + static_cast<float>(lg_theta));
+
+                        epoch_loss_acc += local_epoch_loss_acc;
+                        batch_tokens += local_batch_tokens;
+                        epoch_token_count += local_epoch_tokens;
+                        epoch_example_count += local_epoch_examples;
+                        nonfinite_skips += local_nonfinite_skips;
+                        objective_evals += local_objective_evals;
+                        });
 
                     if (batch_tokens == 0) {
                         continue;
