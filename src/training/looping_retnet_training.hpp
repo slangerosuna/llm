@@ -1831,11 +1831,17 @@ public:
                                 static_cast<float>(lg_theta) + static_cast<float>(tanh_grad.dtheta));
 
                             if (cfg_.backprop_include_loop_supervision) {
-                                const size_t target_action = action_supervision_target_from_logits(
-                                    sc.logits,
-                                    static_cast<uint8_t>(sc.target),
-                                    cfg_.enable_query && bf_memory_active,
-                                    tr);
+                                // BackpropFull trains with a forced single-step forward pass
+                                // (equivalent to always choosing OUTPUT on the first inner
+                                // iteration).  Using the sequence-step index 'tr' as
+                                // decision_index was wrong: it caused the action head to be
+                                // supervised toward LOOP/QUERY while the forward always forced
+                                // OUTPUT, so at inference the model would loop into state-space
+                                // regions never seen during training and produce all spaces.
+                                // Always supervise OUTPUT to keep training consistent with the
+                                // single-step forward computation.
+                                const size_t target_action =
+                                    static_cast<size_t>(llm::arch::ModelAction::OUTPUT);
 
                                 float action_ce = 0.0f;
                                 arch::Vector d_action = softmax_ce_grad_from_logits(
