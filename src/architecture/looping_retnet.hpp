@@ -42,15 +42,16 @@ enum class ModelAction : uint8_t { OUTPUT = 0, QUERY_MEMORY = 1, LOOP = 2 };
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
+// this config is for a 1M model
 struct LoopConfig {
     size_t char_vocab  = 256;  // byte-level vocabulary size
-    size_t model_dim   = 128;  // embedding / hidden dimension
-    size_t qk_dim      = 64;   // query/key dimension for RetNet and Attention
-    size_t v_dim       = 64;   // value dimension (== semvec_dim for graph compat)
-    size_t rel_dim     = 32;   // relation vector dimension (smaller edge label)
-    size_t hidden_layers = 0;  // extra v_dim -> v_dim hidden layers before heads
+    size_t model_dim   = 256;  // embedding / hidden dimension
+    size_t qk_dim      = 256;   // query/key dimension for RetNet and Attention
+    size_t v_dim       = 256;   // value dimension (== semvec_dim for graph compat)
+    size_t rel_dim     = 128;   // relation vector dimension (smaller edge label)
+    size_t hidden_layers = 5;  // extra v_dim -> v_dim hidden layers before heads
     float  decay       = 0.9f; // RetNet recurrent decay
-    size_t max_steps   = 8;    // max inner iterations before forced output
+    size_t max_steps   = 16;    // max inner iterations before forced output
 };
 
 // ── Simple learned linear projection ─────────────────────────────────────────
