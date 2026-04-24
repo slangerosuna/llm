@@ -478,6 +478,8 @@ void print_usage(const char* program) {
       << "  --epochs N                    Training epochs\n"
       << "  --learning-rate F             Learning rate\n"
       << "  --batch-size N                Batch size\n"
+      << "  --host-threads N              Host CPU worker threads (0 = auto)\n"
+      << "  --min-parallel-batch N        Min batch examples before threading\n"
       << "  --weight-decay F              Weight decay\n"
       << "  --sgd-momentum F              SGD momentum\n"
       << "  --samples-per-epoch N         Random samples per epoch (0 = use all)\n"
@@ -589,6 +591,12 @@ int run_train_command(const ParsedArgs& args) {
   }
   if (has_flag(args, "batch-size")) {
     train_cfg.batch_size = parse_size(get_flag(args, "batch-size"), "batch-size");
+  }
+  if (has_flag(args, "host-threads")) {
+    train_cfg.host_threads = parse_size(get_flag(args, "host-threads"), "host-threads");
+  }
+  if (has_flag(args, "min-parallel-batch")) {
+    train_cfg.min_parallel_batch_examples = parse_size(get_flag(args, "min-parallel-batch"), "min-parallel-batch");
   }
   if (has_flag(args, "backprop-force-single-step")) {
     train_cfg.backprop_force_single_step = parse_bool(get_flag(args, "backprop-force-single-step"));

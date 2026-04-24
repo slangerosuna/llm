@@ -10,6 +10,9 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <mutex>
+#include <exception>
 #include <utility>
 #include <vector>
 
@@ -59,6 +62,11 @@ struct TrainConfig {
 
     // Minibatch support used by both modes where applicable.
     size_t batch_size = 256;
+    // Host-side parallelism for per-example work in minibatches.
+    // 0 = auto (use hardware_concurrency), 1 = force single-thread.
+    size_t host_threads = 0;
+    // Avoid thread overhead for tiny batches.
+    size_t min_parallel_batch_examples = 16;
     bool disable_memory_writes_when_query_disabled = true;
 
     // Backprop-over-heads mode knobs.
@@ -162,6 +170,79 @@ class LoopingRetNetSGDTrainer {
         const float cur = static_cast<float>(max_samples)
             + (static_cast<float>(min_samples) - static_cast<float>(max_samples)) * smooth;
         return std::max<size_t>(1, static_cast<size_t>(std::lround(cur)));
+    }
+
+    size_t effective_host_threads() const {
+        if (cfg_.host_threads > 0) {
+            return std::max<size_t>(1, cfg_.host_threads);
+        }
+        const unsigned int hc = std::thread::hardware_concurrency();
+        return std::max<size_t>(1, static_cast<size_t>(hc == 0 ? 1 : hc));
+    }
+
+    static uint32_t per_example_seed(
+        uint32_t base_seed,
+        size_t epoch_1_based,
+        size_t batch_start,
+        size_t example_index)
+    {
+        uint64_t x = static_cast<uint64_t>(base_seed) + 0x9e3779b97f4a7c15ULL;
+        x ^= static_cast<uint64_t>(epoch_1_based) + 0xBF58476D1CE4E5B9ULL + (x << 6) + (x >> 2);
+        x ^= static_cast<uint64_t>(batch_start) + 0x94D049BB133111EBULL + (x << 6) + (x >> 2);
+        x ^= static_cast<uint64_t>(example_index) + 0xD6E8FEB86659FD93ULL + (x << 6) + (x >> 2);
+        x ^= (x >> 30);
+        x *= 0xBF58476D1CE4E5B9ULL;
+        x ^= (x >> 27);
+        x *= 0x94D049BB133111EBULL;
+        x ^= (x >> 31);
+        return static_cast<uint32_t>(x & 0xFFFFFFFFu);
+    }
+
+    template <typename Fn>
+    static void parallel_for_ranges(
+        size_t begin,
+        size_t end,
+        size_t thread_count,
+        Fn&& fn)
+    {
+        if (end <= begin) {
+            return;
+        }
+        const size_t n = end - begin;
+        const size_t workers = std::max<size_t>(1, std::min(thread_count, n));
+        if (workers == 1) {
+            fn(begin, end, 0);
+            return;
+        }
+
+        std::vector<std::thread> threads;
+        threads.reserve(workers);
+        std::exception_ptr first_error;
+        std::mutex error_mtx;
+
+        for (size_t w = 0; w < workers; ++w) {
+            const size_t s = begin + (w * n) / workers;
+            const size_t e = begin + ((w + 1) * n) / workers;
+            threads.emplace_back([&, s, e, w]() {
+                try {
+                    if (s < e) {
+                        fn(s, e, w);
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mtx);
+                    if (!first_error) {
+                        first_error = std::current_exception();
+                    }
+                }
+            });
+        }
+
+        for (auto& t : threads) {
+            t.join();
+        }
+        if (first_error) {
+            std::rethrow_exception(first_error);
+        }
     }
 
     bool memory_active_for_epoch(size_t epoch_1_based) const {
@@ -976,230 +1057,298 @@ public:
                     p_load_b.values = load_b;
                     p_load_b.grads.assign(load_b.size(), static_cast<Scalar>(0.0f));
 
-                    std::bernoulli_distribution force_query_dist(std::clamp(cfg_.force_query_prob, 0.0f, 1.0f));
+                    const size_t batch_examples = batch_end - batch_start;
+                    const bool use_parallel_examples = (effective_host_threads() > 1)
+                        && (batch_examples >= cfg_.min_parallel_batch_examples);
+                    const size_t example_threads = use_parallel_examples
+                        ? std::min(effective_host_threads(), batch_examples)
+                        : 1;
 
                     size_t batch_tokens = 0;
-
-                    for (size_t exi = batch_start; exi < batch_end; ++exi) {
-                        const auto& ex = epoch_dataset[exi];
-                        if (ex.input.empty() || ex.target.empty()) {
-                            continue;
+                    std::mutex accum_mutex;
+                    auto add_grad_vec = [](std::vector<Scalar>& dst, const std::vector<Scalar>& src) {
+                        if (dst.size() != src.size()) {
+                            return;
                         }
-
-                        const size_t steps = std::min(ex.input.size(), ex.target.size());
-                        if (steps == 0) {
-                            continue;
+                        for (size_t i = 0; i < dst.size(); ++i) {
+                            dst[i] = static_cast<Scalar>(
+                                static_cast<float>(dst[i]) + static_cast<float>(src[i]));
                         }
-                        std::uniform_int_distribution<size_t> start_dist(0, steps - 1);
-                        const size_t start = start_dist(rng);
+                    };
 
-                        Graph graph;
-                        SpatialMap spatial_map;
-                        memory::NodeCompressor compressor(model.config().v_dim, cfg_.memory_cfg.semvec_dim, cfg_.seed);
-                        memory::GraphMemoryBridge bridge(graph, spatial_map, std::move(compressor), cfg_.memory_cfg);
-                        memory::MultiHopQuery query(graph, spatial_map, cfg_.memory_cfg);
+                    parallel_for_ranges(
+                        batch_start,
+                        batch_end,
+                        example_threads,
+                        [&](size_t ex_begin, size_t ex_end, size_t /*worker_id*/) {
+                            std::vector<Scalar> local_out_w_grads(out_w.size(), static_cast<Scalar>(0.0f));
+                            std::vector<Scalar> local_out_b_grads(out_b.size(), static_cast<Scalar>(0.0f));
+                            Scalar local_theta_grad = static_cast<Scalar>(0.0f);
+                            std::vector<Scalar> local_act_w_grads(
+                                cfg_.backprop_include_loop_supervision ? act_w.size() : 0,
+                                static_cast<Scalar>(0.0f));
+                            std::vector<Scalar> local_act_b_grads(
+                                cfg_.backprop_include_loop_supervision ? act_b.size() : 0,
+                                static_cast<Scalar>(0.0f));
+                            std::vector<Scalar> local_load_w_grads(load_w.size(), static_cast<Scalar>(0.0f));
+                            std::vector<Scalar> local_load_b_grads(load_b.size(), static_cast<Scalar>(0.0f));
 
-                        arch::KVState recurrent_state;
-                        arch::AttentionMemory kv_cache;
+                            float local_epoch_loss_acc = 0.0f;
+                            size_t local_batch_tokens = 0;
+                            size_t local_epoch_token_count = 0;
+                            size_t local_epoch_example_count = 0;
+                            size_t local_nonfinite_skips = 0;
+                            size_t local_query_events = 0;
+                            size_t local_objective_evals = 0;
+                            double local_seq_forward_ms = 0.0;
 
-                        arch::Vector bp_prev_raw_logits; // Phase 4: multi-step consistency
-                        for (size_t ti = 0; ti < steps; ++ti) {
-                            const size_t t = (start + ti) % steps;
-
-                            const bool bp_memory_active = memory_active_for_epoch(epoch + 1);
-                            const bool use_query = cfg_.backprop_force_single_step
-                                ? false
-                                : (cfg_.enable_query && bp_memory_active);
-                            const bool force_output = cfg_.backprop_force_single_step ? true : cfg_.force_output;
-                            const size_t forced_loops = cfg_.backprop_force_single_step
-                                ? 1
-                                : std::max<size_t>(1, cfg_.forced_loop_min);
-                            const bool write_memory = !cfg_.disable_memory_writes_when_query_disabled || use_query;
-                            const bool force_query_first = use_query && force_query_dist(rng);
-
-                            const auto trace_t0 = std::chrono::steady_clock::now();
-                            const auto trace = model.step_with_trace(
-                                ex.input[t],
-                                recurrent_state,
-                                kv_cache,
-                                bridge,
-                                query,
-                                force_output,
-                                use_query,
-                                forced_loops,
-                                false,
-                                write_memory,
-                                force_query_first);
-                            const auto trace_t1 = std::chrono::steady_clock::now();
-                            seq_forward_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(trace_t1 - trace_t0).count();
-                            query_events += trace.query_count;
-                            ++objective_evals;
-
-                            float out_ce = 0.0f;
-                            arch::Vector d_logits = softmax_ce_grad_from_logits(
-                                trace.logits,
-                                static_cast<size_t>(static_cast<uint8_t>(ex.target[t])),
-                                out_ce);
-                            if (!std::isfinite(out_ce)) {
-                                ++nonfinite_skips;
-                                continue;
-                            }
-                            epoch_loss_acc += out_ce;
-
-                            const auto tanh_grad = arch::activation::dparam_tanh(
-                                trace.raw_logits,
-                                model.output_theta(),
-                                d_logits);
-
-                            arch::Vector d_raw_combined = tanh_grad.dx;
-                            if (cfg_.multistep_consistency_weight > 0.0f
-                                && !bp_prev_raw_logits.empty()
-                                && !trace.raw_logits.empty()
-                                && trace.raw_logits.size() == bp_prev_raw_logits.size()) {
-                                const size_t D = trace.raw_logits.size();
-                                const float w_norm = cfg_.multistep_consistency_weight * 2.0f
-                                    / static_cast<float>(D);
-                                float cons = 0.0f;
-                                for (size_t o = 0; o < D; ++o) {
-                                    const float diff = static_cast<float>(trace.raw_logits[o])
-                                        - static_cast<float>(bp_prev_raw_logits[o]);
-                                    cons += diff * diff;
-                                    d_raw_combined[o] = static_cast<Scalar>(
-                                        static_cast<float>(d_raw_combined[o]) + w_norm * diff);
-                                }
-                                epoch_loss_acc += cfg_.multistep_consistency_weight
-                                    * cons / static_cast<float>(D);
-                            }
-                            bp_prev_raw_logits = trace.raw_logits;
-
-                            if (cfg_.backprop_fd_check_samples > 0
-                                && gradcheck_count < cfg_.backprop_fd_check_samples
-                                && !trace.final_state.empty()
-                                && !trace.raw_logits.empty()) {
-                                const size_t o = gradcheck_count % out_dim;
-                                const size_t i = (gradcheck_count * 17) % out_in;
-                                const size_t wi = o * out_in + i;
-
-                                const float analytic = static_cast<float>(tanh_grad.dx[o])
-                                    * static_cast<float>(trace.final_state[i]);
-
-                                auto ce_with_weight = [&](float wv) {
-                                    arch::Vector raw(out_dim, static_cast<Scalar>(0.0f));
-                                    for (size_t oo = 0; oo < out_dim; ++oo) {
-                                        float s = static_cast<float>(out_b[oo]);
-                                        for (size_t ii = 0; ii < out_in; ++ii) {
-                                            const size_t wii = oo * out_in + ii;
-                                            const float ww = (wii == wi) ? wv : static_cast<float>(out_w[wii]);
-                                            s += ww * static_cast<float>(trace.final_state[ii]);
-                                        }
-                                        raw[oo] = static_cast<Scalar>(s);
-                                    }
-                                    const arch::Vector logits = arch::activation::param_tanh(raw, model.output_theta());
-                                    return cross_entropy_from_logits(
-                                        logits,
-                                        static_cast<uint8_t>(ex.target[t]));
-                                };
-
-                                const float eps = std::max(1e-5f, cfg_.backprop_fd_check_eps);
-                                const float base_w = static_cast<float>(out_w[wi]);
-                                const float l_plus = ce_with_weight(base_w + eps);
-                                const float l_minus = ce_with_weight(base_w - eps);
-                                if (std::isfinite(l_plus) && std::isfinite(l_minus)) {
-                                    const float fd = (l_plus - l_minus) / (2.0f * eps);
-                                    const float denom = std::max(1e-5f, std::fabs(fd));
-                                    gradcheck_rel_err_sum += std::fabs(analytic - fd) / denom;
-                                    ++gradcheck_count;
-                                }
-                            }
-
-                            for (size_t o = 0; o < out_dim; ++o) {
-                                const float d_raw = static_cast<float>(d_raw_combined[o]);
-                                if (!std::isfinite(d_raw)) {
-                                    ++nonfinite_skips;
+                            for (size_t exi = ex_begin; exi < ex_end; ++exi) {
+                                const auto& ex = epoch_dataset[exi];
+                                if (ex.input.empty() || ex.target.empty()) {
                                     continue;
                                 }
-                                p_out_b.grads[o] = static_cast<Scalar>(
-                                    static_cast<float>(p_out_b.grads[o]) + d_raw);
-                                for (size_t i = 0; i < out_in; ++i) {
-                                    const float s = static_cast<float>(trace.final_state[i]);
-                                    const size_t wi = o * out_in + i;
-                                    p_out_w.grads[wi] = static_cast<Scalar>(
-                                        static_cast<float>(p_out_w.grads[wi]) + d_raw * s);
-                                }
-                            }
-                            p_theta.grads[0] = static_cast<Scalar>(
-                                static_cast<float>(p_theta.grads[0]) + static_cast<float>(tanh_grad.dtheta));
 
-                            if (cfg_.backprop_include_loop_supervision
-                                && trace.per_step_output_logits.size() > 1
-                                && trace.per_step_action_logits.size() == trace.per_step_states.size()) {
-                                for (size_t si = 0; si + 1 < trace.per_step_output_logits.size(); ++si) {
-                                    const size_t target_action = action_supervision_target_from_logits(
-                                        trace.per_step_output_logits[si],
-                                        static_cast<uint8_t>(ex.target[t]),
+                                const size_t steps = std::min(ex.input.size(), ex.target.size());
+                                if (steps == 0) {
+                                    continue;
+                                }
+
+                                std::mt19937 ex_rng(per_example_seed(cfg_.seed, epoch + 1, batch_start, exi));
+                                std::uniform_int_distribution<size_t> start_dist(0, steps - 1);
+                                const size_t start = start_dist(ex_rng);
+                                std::bernoulli_distribution force_query_dist(
+                                    std::clamp(cfg_.force_query_prob, 0.0f, 1.0f));
+
+                                Graph graph;
+                                SpatialMap spatial_map;
+                                memory::NodeCompressor compressor(model.config().v_dim, cfg_.memory_cfg.semvec_dim, cfg_.seed);
+                                memory::GraphMemoryBridge bridge(graph, spatial_map, std::move(compressor), cfg_.memory_cfg);
+                                memory::MultiHopQuery query(graph, spatial_map, cfg_.memory_cfg);
+
+                                arch::KVState recurrent_state;
+                                arch::AttentionMemory kv_cache;
+
+                                arch::Vector bp_prev_raw_logits; // Phase 4: multi-step consistency
+                                for (size_t ti = 0; ti < steps; ++ti) {
+                                    const size_t t = (start + ti) % steps;
+
+                                    const bool bp_memory_active = memory_active_for_epoch(epoch + 1);
+                                    const bool use_query = cfg_.backprop_force_single_step
+                                        ? false
+                                        : (cfg_.enable_query && bp_memory_active);
+                                    const bool force_output = cfg_.backprop_force_single_step ? true : cfg_.force_output;
+                                    const size_t forced_loops = cfg_.backprop_force_single_step
+                                        ? 1
+                                        : std::max<size_t>(1, cfg_.forced_loop_min);
+                                    const bool write_memory = !cfg_.disable_memory_writes_when_query_disabled || use_query;
+                                    const bool force_query_first = use_query && force_query_dist(ex_rng);
+
+                                    const auto trace_t0 = std::chrono::steady_clock::now();
+                                    const auto trace = model.step_with_trace(
+                                        ex.input[t],
+                                        recurrent_state,
+                                        kv_cache,
+                                        bridge,
+                                        query,
+                                        force_output,
                                         use_query,
-                                        si);
-                                    float action_ce = 0.0f;
-                                    arch::Vector d_action = softmax_ce_grad_from_logits(
-                                        trace.per_step_action_logits[si],
-                                        target_action,
-                                        action_ce);
-                                    if (!std::isfinite(action_ce)) {
-                                        ++nonfinite_skips;
+                                        forced_loops,
+                                        false,
+                                        write_memory,
+                                        force_query_first);
+                                    const auto trace_t1 = std::chrono::steady_clock::now();
+                                    local_seq_forward_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(trace_t1 - trace_t0).count();
+                                    local_query_events += trace.query_count;
+                                    ++local_objective_evals;
+
+                                    float out_ce = 0.0f;
+                                    arch::Vector d_logits = softmax_ce_grad_from_logits(
+                                        trace.logits,
+                                        static_cast<size_t>(static_cast<uint8_t>(ex.target[t])),
+                                        out_ce);
+                                    if (!std::isfinite(out_ce)) {
+                                        ++local_nonfinite_skips;
                                         continue;
                                     }
-                                    epoch_loss_acc += cfg_.loop_supervision_weight * action_ce;
+                                    local_epoch_loss_acc += out_ce;
 
-                                    const auto& state = trace.per_step_states[si];
-                                    for (size_t a = 0; a < act_dim; ++a) {
-                                        const float dag = cfg_.loop_supervision_weight * static_cast<float>(d_action[a]);
-                                        p_act_b.grads[a] = static_cast<Scalar>(
-                                            static_cast<float>(p_act_b.grads[a]) + dag);
-                                        for (size_t i = 0; i < act_in; ++i) {
-                                            const size_t wi = a * act_in + i;
-                                            p_act_w.grads[wi] = static_cast<Scalar>(
-                                                static_cast<float>(p_act_w.grads[wi]) + dag * static_cast<float>(state[i]));
+                                    const auto tanh_grad = arch::activation::dparam_tanh(
+                                        trace.raw_logits,
+                                        model.output_theta(),
+                                        d_logits);
+
+                                    arch::Vector d_raw_combined = tanh_grad.dx;
+                                    if (cfg_.multistep_consistency_weight > 0.0f
+                                        && !bp_prev_raw_logits.empty()
+                                        && !trace.raw_logits.empty()
+                                        && trace.raw_logits.size() == bp_prev_raw_logits.size()) {
+                                        const size_t D = trace.raw_logits.size();
+                                        const float w_norm = cfg_.multistep_consistency_weight * 2.0f
+                                            / static_cast<float>(D);
+                                        float cons = 0.0f;
+                                        for (size_t o = 0; o < D; ++o) {
+                                            const float diff = static_cast<float>(trace.raw_logits[o])
+                                                - static_cast<float>(bp_prev_raw_logits[o]);
+                                            cons += diff * diff;
+                                            d_raw_combined[o] = static_cast<Scalar>(
+                                                static_cast<float>(d_raw_combined[o]) + w_norm * diff);
+                                        }
+                                        local_epoch_loss_acc += cfg_.multistep_consistency_weight
+                                            * cons / static_cast<float>(D);
+                                    }
+                                    bp_prev_raw_logits = trace.raw_logits;
+
+                                    if (cfg_.backprop_fd_check_samples > 0
+                                        && !use_parallel_examples
+                                        && gradcheck_count < cfg_.backprop_fd_check_samples
+                                        && !trace.final_state.empty()
+                                        && !trace.raw_logits.empty()) {
+                                        const size_t o = gradcheck_count % out_dim;
+                                        const size_t i = (gradcheck_count * 17) % out_in;
+                                        const size_t wi = o * out_in + i;
+
+                                        const float analytic = static_cast<float>(tanh_grad.dx[o])
+                                            * static_cast<float>(trace.final_state[i]);
+
+                                        auto ce_with_weight = [&](float wv) {
+                                            arch::Vector raw(out_dim, static_cast<Scalar>(0.0f));
+                                            for (size_t oo = 0; oo < out_dim; ++oo) {
+                                                float s = static_cast<float>(out_b[oo]);
+                                                for (size_t ii = 0; ii < out_in; ++ii) {
+                                                    const size_t wii = oo * out_in + ii;
+                                                    const float ww = (wii == wi) ? wv : static_cast<float>(out_w[wii]);
+                                                    s += ww * static_cast<float>(trace.final_state[ii]);
+                                                }
+                                                raw[oo] = static_cast<Scalar>(s);
+                                            }
+                                            const arch::Vector logits = arch::activation::param_tanh(raw, model.output_theta());
+                                            return cross_entropy_from_logits(
+                                                logits,
+                                                static_cast<uint8_t>(ex.target[t]));
+                                        };
+
+                                        const float eps = std::max(1e-5f, cfg_.backprop_fd_check_eps);
+                                        const float base_w = static_cast<float>(out_w[wi]);
+                                        const float l_plus = ce_with_weight(base_w + eps);
+                                        const float l_minus = ce_with_weight(base_w - eps);
+                                        if (std::isfinite(l_plus) && std::isfinite(l_minus)) {
+                                            const float fd = (l_plus - l_minus) / (2.0f * eps);
+                                            const float denom = std::max(1e-5f, std::fabs(fd));
+                                            gradcheck_rel_err_sum += std::fabs(analytic - fd) / denom;
+                                            ++gradcheck_count;
                                         }
                                     }
+
+                                    for (size_t o = 0; o < out_dim; ++o) {
+                                        const float d_raw = static_cast<float>(d_raw_combined[o]);
+                                        if (!std::isfinite(d_raw)) {
+                                            ++local_nonfinite_skips;
+                                            continue;
+                                        }
+                                        local_out_b_grads[o] = static_cast<Scalar>(
+                                            static_cast<float>(local_out_b_grads[o]) + d_raw);
+                                        for (size_t i = 0; i < out_in; ++i) {
+                                            const float s = static_cast<float>(trace.final_state[i]);
+                                            const size_t wi = o * out_in + i;
+                                            local_out_w_grads[wi] = static_cast<Scalar>(
+                                                static_cast<float>(local_out_w_grads[wi]) + d_raw * s);
+                                        }
+                                    }
+                                    local_theta_grad = static_cast<Scalar>(
+                                        static_cast<float>(local_theta_grad) + static_cast<float>(tanh_grad.dtheta));
+
+                                    if (cfg_.backprop_include_loop_supervision
+                                        && trace.per_step_output_logits.size() > 1
+                                        && trace.per_step_action_logits.size() == trace.per_step_states.size()) {
+                                        for (size_t si = 0; si + 1 < trace.per_step_output_logits.size(); ++si) {
+                                            const size_t target_action = action_supervision_target_from_logits(
+                                                trace.per_step_output_logits[si],
+                                                static_cast<uint8_t>(ex.target[t]),
+                                                use_query,
+                                                si);
+                                            float action_ce = 0.0f;
+                                            arch::Vector d_action = softmax_ce_grad_from_logits(
+                                                trace.per_step_action_logits[si],
+                                                target_action,
+                                                action_ce);
+                                            if (!std::isfinite(action_ce)) {
+                                                ++local_nonfinite_skips;
+                                                continue;
+                                            }
+                                            local_epoch_loss_acc += cfg_.loop_supervision_weight * action_ce;
+
+                                            const auto& state = trace.per_step_states[si];
+                                            for (size_t a = 0; a < act_dim; ++a) {
+                                                const float dag = cfg_.loop_supervision_weight * static_cast<float>(d_action[a]);
+                                                local_act_b_grads[a] = static_cast<Scalar>(
+                                                    static_cast<float>(local_act_b_grads[a]) + dag);
+                                                for (size_t i = 0; i < act_in; ++i) {
+                                                    const size_t wi = a * act_in + i;
+                                                    local_act_w_grads[wi] = static_cast<Scalar>(
+                                                        static_cast<float>(local_act_w_grads[wi]) + dag * static_cast<float>(state[i]));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if (trace.per_step_load_logits.size() == trace.per_step_states.size()
+                                        && trace.per_step_output_logits.size() == trace.per_step_states.size()) {
+                                        for (size_t si = 0; si < trace.per_step_states.size(); ++si) {
+                                            const size_t target_action = action_supervision_target_from_logits(
+                                                trace.per_step_output_logits[si],
+                                                static_cast<uint8_t>(ex.target[t]),
+                                                use_query,
+                                                si);
+                                            const float target_load =
+                                                (target_action == static_cast<size_t>(llm::arch::ModelAction::QUERY_MEMORY))
+                                                ? 1.0f
+                                                : 0.0f;
+                                            const auto [load_ce, d_logit] = binary_ce_and_grad(
+                                                static_cast<float>(trace.per_step_load_logits[si]),
+                                                target_load);
+                                            if (!std::isfinite(load_ce) || !std::isfinite(d_logit)) {
+                                                ++local_nonfinite_skips;
+                                                continue;
+                                            }
+                                            local_epoch_loss_acc += cfg_.load_gate_supervision_weight * load_ce;
+                                            const float d = cfg_.load_gate_supervision_weight * d_logit;
+                                            local_load_b_grads[0] = static_cast<Scalar>(
+                                                static_cast<float>(local_load_b_grads[0]) + d);
+                                            const auto& state = trace.per_step_states[si];
+                                            for (size_t i = 0; i < load_in; ++i) {
+                                                local_load_w_grads[i] = static_cast<Scalar>(
+                                                    static_cast<float>(local_load_w_grads[i]) + d * static_cast<float>(state[i]));
+                                            }
+                                        }
+                                    }
+
+                                    ++local_batch_tokens;
+                                    ++local_epoch_token_count;
                                 }
+                                ++local_epoch_example_count;
                             }
 
-                            if (trace.per_step_load_logits.size() == trace.per_step_states.size()
-                                && trace.per_step_output_logits.size() == trace.per_step_states.size()) {
-                                for (size_t si = 0; si < trace.per_step_states.size(); ++si) {
-                                    const size_t target_action = action_supervision_target_from_logits(
-                                        trace.per_step_output_logits[si],
-                                        static_cast<uint8_t>(ex.target[t]),
-                                        use_query,
-                                        si);
-                                    const float target_load =
-                                        (target_action == static_cast<size_t>(llm::arch::ModelAction::QUERY_MEMORY))
-                                        ? 1.0f
-                                        : 0.0f;
-                                    const auto [load_ce, d_logit] = binary_ce_and_grad(
-                                        static_cast<float>(trace.per_step_load_logits[si]),
-                                        target_load);
-                                    if (!std::isfinite(load_ce) || !std::isfinite(d_logit)) {
-                                        ++nonfinite_skips;
-                                        continue;
-                                    }
-                                    epoch_loss_acc += cfg_.load_gate_supervision_weight * load_ce;
-                                    const float d = cfg_.load_gate_supervision_weight * d_logit;
-                                    p_load_b.grads[0] = static_cast<Scalar>(
-                                        static_cast<float>(p_load_b.grads[0]) + d);
-                                    const auto& state = trace.per_step_states[si];
-                                    for (size_t i = 0; i < load_in; ++i) {
-                                        p_load_w.grads[i] = static_cast<Scalar>(
-                                            static_cast<float>(p_load_w.grads[i]) + d * static_cast<float>(state[i]));
-                                    }
-                                }
+                            std::lock_guard<std::mutex> lock(accum_mutex);
+                            add_grad_vec(p_out_w.grads, local_out_w_grads);
+                            add_grad_vec(p_out_b.grads, local_out_b_grads);
+                            p_theta.grads[0] = static_cast<Scalar>(
+                                static_cast<float>(p_theta.grads[0]) + static_cast<float>(local_theta_grad));
+                            if (cfg_.backprop_include_loop_supervision) {
+                                add_grad_vec(p_act_w.grads, local_act_w_grads);
+                                add_grad_vec(p_act_b.grads, local_act_b_grads);
                             }
+                            add_grad_vec(p_load_w.grads, local_load_w_grads);
+                            add_grad_vec(p_load_b.grads, local_load_b_grads);
 
-                            ++batch_tokens;
-                            ++epoch_token_count;
-                        }
-                        ++epoch_example_count;
-                    }
+                            epoch_loss_acc += local_epoch_loss_acc;
+                            batch_tokens += local_batch_tokens;
+                            epoch_token_count += local_epoch_token_count;
+                            epoch_example_count += local_epoch_example_count;
+                            nonfinite_skips += local_nonfinite_skips;
+                            query_events += local_query_events;
+                            objective_evals += local_objective_evals;
+                            seq_forward_ms += local_seq_forward_ms;
+                        });
 
                     if (batch_tokens == 0) {
                         continue;
