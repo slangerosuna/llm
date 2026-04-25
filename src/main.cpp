@@ -651,6 +651,10 @@ int run_train_command(const ParsedArgs& args) {
     train_cfg.memory_cfg.max_write_entries = parse_size(get_flag(args, "memory-max-write-entries"), "memory-max-write-entries");
   }
 
+  if (has_flag(args, "focal-gamma")) {
+    train_cfg.focal_gamma = parse_float(get_flag(args, "focal-gamma"), "focal-gamma");
+  }
+
   const std::vector<std::string> raw_lines = load_dataset_lines(dataset_path);
   std::cout << "Loaded raw lines: " << raw_lines.size() << "\n";
 
@@ -805,4 +809,4 @@ int main(int argc, char** argv) {
     std::cerr << err.what() << "\n";
     return 1;
   }
-}
+}:ring: 
