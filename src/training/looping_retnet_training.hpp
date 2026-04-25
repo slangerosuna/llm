@@ -1798,7 +1798,7 @@ public:
                                         d_raw_consistency[tr + 1][o] = static_cast<Scalar>(
                                             static_cast<float>(d_raw_consistency[tr + 1][o]) + w_norm * diff);
                                     }
-                                    epoch_loss_acc += cfg_.multistep_consistency_weight
+                                    local_epoch_loss_acc += cfg_.multistep_consistency_weight
                                         * cons / static_cast<float>(out_dim);
                                 }
                             }
@@ -1849,7 +1849,7 @@ public:
                                     target_action,
                                     action_ce);
                                 if (std::isfinite(action_ce)) {
-                                    epoch_loss_acc += cfg_.loop_supervision_weight * action_ce;
+                                    local_epoch_loss_acc += cfg_.loop_supervision_weight * action_ce;
                                     for (size_t i = 0; i < d_action.size(); ++i) {
                                         d_action[i] = static_cast<Scalar>(
                                             static_cast<float>(d_action[i]) * cfg_.loop_supervision_weight);
@@ -1872,7 +1872,7 @@ public:
                                         static_cast<float>(sc.load_logit),
                                         target_load);
                                     if (std::isfinite(load_ce) && std::isfinite(d_load)) {
-                                        epoch_loss_acc += cfg_.load_gate_supervision_weight * load_ce;
+                                        local_epoch_loss_acc += cfg_.load_gate_supervision_weight * load_ce;
                                         const float d = cfg_.load_gate_supervision_weight * d_load;
                                         lg_load_b[0] = static_cast<Scalar>(
                                             static_cast<float>(lg_load_b[0]) + d);

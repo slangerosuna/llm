@@ -722,6 +722,15 @@ int run_infer_command(const ParsedArgs& args) {
   llm::arch::AttentionMemory kv_cache;
 
   char current = prompt.empty() ? ' ' : prompt.back();
+  // BackpropFull trains with a single recurrent step and no KV-cache accumulation
+  // (state = ret_norm + v_current).  To match that distribution at inference time we
+  // must also use exactly one inner step (forced_loops=1) and suppress KV-cache
+  // writes (enable_memory_write=false).  Without this the attention output is a
+  // weighted blend of ALL past values which the model has never seen during training,
+  // producing out-of-distribution states that consistently decode to the most-frequent
+  // character (space).
+  constexpr size_t kInferForcedLoops    = 1;     // one step = matches BackpropFull
+  constexpr bool   kInferWriteMemory    = false; // no KV-cache accumulation
   for (char c : prompt) {
     const auto step = model.step_with_trace(
         c,
@@ -731,9 +740,9 @@ int run_infer_command(const ParsedArgs& args) {
         query,
         force_output,
         enable_query,
-        0,
+        kInferForcedLoops,
         use_parallel_retention,
-        true);
+        kInferWriteMemory);
     (void)step;
     current = c;
   }
@@ -749,9 +758,9 @@ int run_infer_command(const ParsedArgs& args) {
         query,
         force_output,
         enable_query,
-        0,
+        kInferForcedLoops,
         use_parallel_retention,
-        true);
+        kInferWriteMemory);
     current = step.output_char;
     generated.push_back(current);
   }
