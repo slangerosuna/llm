@@ -35,6 +35,12 @@ enum class TrainMode : uint8_t {
     BackpropFull = 2,
 };
 
+enum class OutputLossType : uint8_t {
+    CrossEntropy = 0,         // standard -log(p_t)
+    WeightedCrossEntropy = 1, // w_t * -log(p_t)
+    FocalLoss = 2,            // (1-p_t)^gamma * -log(p_t), optionally with class weights
+};
+
 struct TrainConfig {
     TrainMode mode = TrainMode::BackpropFull;
     size_t epochs = 256;
@@ -108,6 +114,14 @@ struct TrainConfig {
     uint32_t seed = 7;
     // 0 = use all examples each epoch; >0 = randomly sample this many (with replacement)
     size_t samples_per_epoch = 0;
+
+    // Output character-prediction loss type.
+    OutputLossType output_loss_type = OutputLossType::FocalLoss;
+    // Focusing parameter for FocalLoss (>= 0; 0 == standard CE, 2 is a common default).
+    float focal_gamma = 3.0f;
+    // Per-class weights for WeightedCrossEntropy / FocalLoss.  Empty == uniform (all 1.0).
+    // Size must equal the vocabulary size (256 for byte-level models).
+    std::vector<float> class_weights;
 
     memory::MemoryConfig memory_cfg{};
 };
@@ -548,6 +562,85 @@ class LoopingRetNetSGDTrainer {
         return dx;
     }
 
+    float class_weight_for(size_t target) const {
+        if (cfg_.class_weights.empty() || target >= cfg_.class_weights.size()) {
+            return 1.0f;
+        }
+        return std::max(0.0f, cfg_.class_weights[target]);
+    }
+
+    // Dispatch to the configured output loss type (no gradient).
+    float output_loss_from_logits(const arch::Vector& logits, size_t target) const {
+        const float ce = cross_entropy_from_logits(logits, static_cast<uint8_t>(target));
+        switch (cfg_.output_loss_type) {
+            case OutputLossType::WeightedCrossEntropy:
+                return class_weight_for(target) * ce;
+            case OutputLossType::FocalLoss: {
+                if (!std::isfinite(ce) || ce >= kNonFinitePenalty) {
+                    return kNonFinitePenalty;
+                }
+                const float p_t = std::exp(-ce);
+                const float one_minus_pt = std::max(0.0f, 1.0f - p_t);
+                const float gamma = cfg_.focal_gamma;
+                const float mod = (gamma > 0.0f) ? std::pow(one_minus_pt, gamma) : 1.0f;
+                return class_weight_for(target) * mod * ce;
+            }
+            default:
+                return ce;
+        }
+    }
+
+    // Compute output loss and its gradient w.r.t. the (param_tanh-scaled) logits.
+    // Dispatches to the configured output loss type.
+    arch::Vector output_loss_and_grad(
+        const arch::Vector& logits, size_t target, float& out_loss) const
+    {
+        switch (cfg_.output_loss_type) {
+            case OutputLossType::WeightedCrossEntropy: {
+                float ce = 0.0f;
+                arch::Vector grad = softmax_ce_grad_from_logits(logits, target, ce);
+                const float w = class_weight_for(target);
+                out_loss = w * ce;
+                for (auto& g : grad)
+                    g = static_cast<Scalar>(static_cast<float>(g) * w);
+                return grad;
+            }
+            case OutputLossType::FocalLoss: {
+                float ce = 0.0f;
+                arch::Vector grad = softmax_ce_grad_from_logits(logits, target, ce);
+                if (!std::isfinite(ce) || ce >= kNonFinitePenalty) {
+                    out_loss = kNonFinitePenalty;
+                    return grad;
+                }
+                if (ce <= 0.0f) {
+                    out_loss = 0.0f;
+                    std::fill(grad.begin(), grad.end(), static_cast<Scalar>(0.0f));
+                    return grad;
+                }
+                const float p_t = std::exp(-ce);
+                const float gamma = cfg_.focal_gamma;
+                const float one_minus_pt = std::max(0.0f, 1.0f - p_t);
+                const float focal_mod = (gamma > 0.0f) ? std::pow(one_minus_pt, gamma) : 1.0f;
+                out_loss = class_weight_for(target) * focal_mod * ce;
+                // d FL/d logit_j = CE_grad_j * [(1-p_t)^γ + γ*(1-p_t)^(γ-1)*p_t*CE]
+                float scale = focal_mod;
+                if (gamma > 0.0f && one_minus_pt > 0.0f) {
+                    scale += gamma * std::pow(one_minus_pt, gamma - 1.0f) * p_t * ce;
+                }
+                scale *= class_weight_for(target);
+                for (auto& g : grad)
+                    g = static_cast<Scalar>(static_cast<float>(g) * scale);
+                return grad;
+            }
+            default: {
+                float ce = 0.0f;
+                arch::Vector grad = softmax_ce_grad_from_logits(logits, target, ce);
+                out_loss = ce;
+                return grad;
+            }
+        }
+    }
+
     float sequence_loss_with_memory(
         arch::LoopingRetNet& model,
         const SequenceExample& ex,
@@ -611,7 +704,7 @@ class LoopingRetNetSGDTrainer {
                 write_memory,
                 force_query_first);
 
-            loss += cross_entropy_from_logits(trace.logits, static_cast<uint8_t>(ex.target[t]));
+            loss += output_loss_from_logits(trace.logits, static_cast<size_t>(static_cast<uint8_t>(ex.target[t])));
             if (!std::isfinite(loss)) {
                 return kNonFinitePenalty;
             }
@@ -1162,7 +1255,7 @@ public:
                                     ++local_objective_evals;
 
                                     float out_ce = 0.0f;
-                                    arch::Vector d_logits = softmax_ce_grad_from_logits(
+                                    arch::Vector d_logits = output_loss_and_grad(
                                         trace.logits,
                                         static_cast<size_t>(static_cast<uint8_t>(ex.target[t])),
                                         out_ce);
@@ -1222,9 +1315,9 @@ public:
                                                 raw[oo] = static_cast<Scalar>(s);
                                             }
                                             const arch::Vector logits = arch::activation::param_tanh(raw, model.output_theta());
-                                            return cross_entropy_from_logits(
+                                            return output_loss_from_logits(
                                                 logits,
-                                                static_cast<uint8_t>(ex.target[t]));
+                                                static_cast<size_t>(static_cast<uint8_t>(ex.target[t])));
                                         };
 
                                         const float eps = std::max(1e-5f, cfg_.backprop_fd_check_eps);
@@ -1756,7 +1849,7 @@ public:
                             sc.logits = arch::activation::param_tanh(sc.raw_logits, p_theta.values[0]);
 
                             float out_ce = 0.0f;
-                            (void)softmax_ce_grad_from_logits(
+                            (void)output_loss_and_grad(
                                 sc.logits,
                                 static_cast<size_t>(sc.target),
                                 out_ce);
@@ -1809,7 +1902,7 @@ public:
                             const StepCache& sc = caches[tr];
 
                             float out_ce = 0.0f;
-                            arch::Vector d_logits = softmax_ce_grad_from_logits(
+                            arch::Vector d_logits = output_loss_and_grad(
                                 sc.logits,
                                 static_cast<size_t>(sc.target),
                                 out_ce);
