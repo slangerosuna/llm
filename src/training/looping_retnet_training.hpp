@@ -122,6 +122,12 @@ struct TrainConfig {
     // Per-class weights for WeightedCrossEntropy / FocalLoss.  Empty == uniform (all 1.0).
     // Size must equal the vocabulary size (256 for byte-level models).
     std::vector<float> class_weights;
+    // Focal-loss class probability cap: p_t = min(sampled_probability, min_p_t).
+    // Keep in [0, 1].  Default 1.0 preserves sampled probabilities unchanged.
+    float min_p_t = 0.001f;
+    // Number of examples randomly sampled (with replacement) to estimate per-class p_t.
+    // 0 means use the full dataset.
+    size_t p_t_sampling_examples = 4096;
 
     memory::MemoryConfig memory_cfg{};
 };
@@ -133,6 +139,7 @@ struct EpochResult {
 
 class LoopingRetNetSGDTrainer {
     TrainConfig cfg_;
+    std::vector<float> sampled_target_pt_;
 
     static constexpr float kNonFinitePenalty = 100.0f;
 
@@ -569,6 +576,68 @@ class LoopingRetNetSGDTrainer {
         return std::max(0.0f, cfg_.class_weights[target]);
     }
 
+    float sampled_pt_for(size_t target) const {
+        if (sampled_target_pt_.empty() || target >= sampled_target_pt_.size()) {
+            return 0.0f;
+        }
+        return sampled_target_pt_[target];
+    }
+
+    void rebuild_sampled_target_pt(
+        const std::vector<SequenceExample>& dataset,
+        size_t output_dim,
+        std::mt19937& rng)
+    {
+        sampled_target_pt_.assign(output_dim, 0.0f);
+        if (dataset.empty() || output_dim == 0) {
+            return;
+        }
+
+        const float pt_cap = std::clamp(cfg_.min_p_t, 0.0f, 1.0f);
+        const size_t sample_count = (cfg_.p_t_sampling_examples == 0)
+            ? dataset.size()
+            : cfg_.p_t_sampling_examples;
+
+        std::vector<uint64_t> counts(output_dim, 0);
+        uint64_t total = 0;
+
+        if (sample_count >= dataset.size()) {
+            for (const auto& ex : dataset) {
+                const size_t steps = std::min(ex.input.size(), ex.target.size());
+                for (size_t i = 0; i < steps; ++i) {
+                    const size_t cls = static_cast<size_t>(static_cast<uint8_t>(ex.target[i]));
+                    if (cls < output_dim) {
+                        ++counts[cls];
+                        ++total;
+                    }
+                }
+            }
+        } else {
+            std::uniform_int_distribution<size_t> idx_dist(0, dataset.size() - 1);
+            for (size_t s = 0; s < sample_count; ++s) {
+                const auto& ex = dataset[idx_dist(rng)];
+                const size_t steps = std::min(ex.input.size(), ex.target.size());
+                for (size_t i = 0; i < steps; ++i) {
+                    const size_t cls = static_cast<size_t>(static_cast<uint8_t>(ex.target[i]));
+                    if (cls < output_dim) {
+                        ++counts[cls];
+                        ++total;
+                    }
+                }
+            }
+        }
+
+        if (total == 0) {
+            return;
+        }
+
+        const float inv_total = 1.0f / static_cast<float>(total);
+        for (size_t c = 0; c < output_dim; ++c) {
+            const float prob = static_cast<float>(counts[c]) * inv_total;
+            sampled_target_pt_[c] = std::min(prob, pt_cap);
+        }
+    }
+
     // Dispatch to the configured output loss type (no gradient).
     float output_loss_from_logits(const arch::Vector& logits, size_t target) const {
         const float ce = cross_entropy_from_logits(logits, static_cast<uint8_t>(target));
@@ -579,7 +648,7 @@ class LoopingRetNetSGDTrainer {
                 if (!std::isfinite(ce) || ce >= kNonFinitePenalty) {
                     return kNonFinitePenalty;
                 }
-                const float p_t = std::exp(-ce);
+                const float p_t = sampled_pt_for(target);
                 const float one_minus_pt = std::max(0.0f, 1.0f - p_t);
                 const float gamma = cfg_.focal_gamma;
                 const float mod = (gamma > 0.0f) ? std::pow(one_minus_pt, gamma) : 1.0f;
@@ -617,17 +686,14 @@ class LoopingRetNetSGDTrainer {
                     std::fill(grad.begin(), grad.end(), static_cast<Scalar>(0.0f));
                     return grad;
                 }
-                const float p_t = std::exp(-ce);
+                const float p_t = sampled_pt_for(target);
                 const float gamma = cfg_.focal_gamma;
                 const float one_minus_pt = std::max(0.0f, 1.0f - p_t);
                 const float focal_mod = (gamma > 0.0f) ? std::pow(one_minus_pt, gamma) : 1.0f;
                 out_loss = class_weight_for(target) * focal_mod * ce;
-                // d FL/d logit_j = CE_grad_j * [(1-p_t)^γ + γ*(1-p_t)^(γ-1)*p_t*CE]
-                float scale = focal_mod;
-                if (gamma > 0.0f && one_minus_pt > 0.0f) {
-                    scale += gamma * std::pow(one_minus_pt, gamma - 1.0f) * p_t * ce;
-                }
-                scale *= class_weight_for(target);
+                // With sampled dataset p_t treated as constant per class,
+                // focal contributes a constant factor on CE gradients.
+                const float scale = class_weight_for(target) * focal_mod;
                 for (auto& g : grad)
                     g = static_cast<Scalar>(static_cast<float>(g) * scale);
                 return grad;
@@ -880,6 +946,7 @@ public:
         }
 
         std::mt19937 rng(cfg_.seed);
+        rebuild_sampled_target_pt(dataset, model.output_dim(), rng);
         SGD optimizer(learning_rate_for_epoch(1), cfg_.weight_decay, cfg_.sgd_momentum);
         float lr_multiplier = 1.0f;
         size_t lr_cooldown_left = 0;
