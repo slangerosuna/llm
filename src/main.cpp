@@ -434,6 +434,62 @@ std::string strip_spaces_before_punct(const std::string& s) {
   return out;
 }
 
+std::string get_memory_module_flag(const ParsedArgs& args) {
+  std::string path = get_flag(args, "memory_module", "m");
+  if (!path.empty()) {
+    return path;
+  }
+  return get_flag(args, "memory-module", "m");
+}
+
+void write_memory_module_from_dataset(
+    const LoopingRetNet& model,
+    const std::vector<llm::training::looping::SequenceExample>& dataset,
+    const llm::memory::MemoryConfig& mem_cfg,
+    uint32_t seed,
+    const std::string& memory_module_path) {
+  if (memory_module_path.empty()) {
+    return;
+  }
+
+  Graph graph;
+  SpatialMap spatial_map;
+  llm::memory::NodeCompressor compressor(model.config().v_dim, mem_cfg.semvec_dim, seed);
+  llm::memory::GraphMemoryBridge bridge(graph, spatial_map, std::move(compressor), mem_cfg);
+  llm::memory::MultiHopQuery query(graph, spatial_map, mem_cfg);
+
+  llm::arch::KVState recurrent_state;
+  llm::arch::AttentionMemory kv_cache;
+
+  constexpr bool kForceOutput = false;
+  constexpr bool kEnableQuery = true;
+  constexpr size_t kForcedLoops = 1;
+  constexpr bool kUseParallelRetention = true;
+  constexpr bool kEnableMemoryWrite = true;
+  constexpr bool kForceQueryFirst = false;
+
+  LoopingRetNet model_copy = model;
+  for (const auto& ex : dataset) {
+    const size_t steps = std::min(ex.input.size(), ex.target.size());
+    for (size_t i = 0; i < steps; ++i) {
+      (void)model_copy.step_with_trace(
+          ex.input[i],
+          recurrent_state,
+          kv_cache,
+          bridge,
+          query,
+          kForceOutput,
+          kEnableQuery,
+          kForcedLoops,
+          kUseParallelRetention,
+          kEnableMemoryWrite,
+          kForceQueryFirst);
+    }
+  }
+
+  graph.save_to_file(memory_module_path);
+}
+
 // Group lines into multi-sentence samples, randomly choosing a count in
 // [min_sentences, max_sentences] per group, then join with a space.
 std::vector<std::string> group_sentences(
@@ -471,7 +527,8 @@ void print_usage(const char* program) {
       << "  " << program << " infer -i MODEL [options]\n\n"
       << "Train required flags:\n"
       << "  -d, --dataset PATH            Plain-text dataset (one sentence per line)\n"
-      << "  -o, --output PATH             Output model binary path\n\n"
+      << "  -o, --output PATH             Output model binary path\n"
+      << "  -m, --memory_module PATH      Save trained memory module graph path\n\n"
       << "Train common optional flags:\n"
       << "  -i, --input PATH              Existing model binary to continue training\n"
       << "  --mode MODE                   FiniteDifference|BackpropHeads|BackpropFull\n"
@@ -492,6 +549,7 @@ void print_usage(const char* program) {
       << "  --hidden-layers N --max-steps N --decay F --model-seed N --train-seed N\n\n"
       << "Infer flags:\n"
       << "  -i, --input PATH              Model binary\n"
+      << "  -m, --memory_module PATH      Load memory module graph path\n"
       << "  -p, --prompt TEXT             Prompt text (default: empty)\n"
       << "  -t, --tokens N                Number of generated chars (default: 128)\n"
       << "  --enable-query BOOL           Allow QUERY_MEMORY action during inference\n"
@@ -513,6 +571,7 @@ int run_train_command(const ParsedArgs& args) {
   }
 
   const std::string input_path = get_flag(args, "input", "i");
+  const std::string memory_module_path = get_memory_module_flag(args);
 
   LoopConfig model_cfg;
   if (has_flag(args, "char-vocab")) {
@@ -687,6 +746,17 @@ int run_train_command(const ParsedArgs& args) {
   }
 
   model.save_to_file(output_path);
+  if (!memory_module_path.empty()) {
+    llm::memory::MemoryConfig export_mem_cfg = train_cfg.memory_cfg;
+    export_mem_cfg.semvec_dim = model.config().v_dim;
+    write_memory_module_from_dataset(
+        model,
+        dataset,
+        export_mem_cfg,
+        train_cfg.seed,
+        memory_module_path);
+    std::cout << "Saved memory module to: " << memory_module_path << "\n";
+  }
   std::cout << "Final loss: " << std::setprecision(7) << history.back().avg_loss << "\n";
   std::cout << "Saved model to: " << output_path << "\n";
   return 0;
@@ -697,6 +767,7 @@ int run_infer_command(const ParsedArgs& args) {
   if (model_path.empty()) {
     throw std::runtime_error("infer requires -i/--input");
   }
+  const std::string memory_module_path = get_memory_module_flag(args);
   const std::string prompt = get_flag(args, "prompt", "p");
   const size_t tokens = has_flag(args, "tokens", "t")
       ? parse_size(get_flag(args, "tokens", "t"), "tokens")
@@ -721,6 +792,11 @@ int run_infer_command(const ParsedArgs& args) {
   llm::memory::NodeCompressor compressor(model.config().v_dim, mem_cfg.semvec_dim);
   llm::memory::GraphMemoryBridge bridge(graph, spatial_map, std::move(compressor), mem_cfg);
   llm::memory::MultiHopQuery query(graph, spatial_map, mem_cfg);
+
+  if (!memory_module_path.empty()) {
+    graph.load_from_file(memory_module_path, spatial_map);
+    std::cout << "Loaded memory module from: " << memory_module_path << "\n";
+  }
 
   llm::arch::KVState recurrent_state;
   llm::arch::AttentionMemory kv_cache;

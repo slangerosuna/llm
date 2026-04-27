@@ -947,7 +947,7 @@ public:
 
         std::mt19937 rng(cfg_.seed);
         rebuild_sampled_target_pt(dataset, model.output_dim(), rng);
-        SGD optimizer(learning_rate_for_epoch(1), cfg_.weight_decay, cfg_.sgd_momentum);
+        Adam optimizer(learning_rate_for_epoch(1), 0.9f, 0.999f, 1e-8f, cfg_.weight_decay);
         float lr_multiplier = 1.0f;
         size_t lr_cooldown_left = 0;
         float prev_epoch_loss = 0.0f;
