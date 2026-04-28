@@ -2,6 +2,9 @@
 #include <sycl/sycl.hpp>
 #include <csignal>
 #include <cstdlib>
+#include <array>
+#include <cmath>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <iomanip>
@@ -380,11 +383,11 @@ ParsedArgs parse_args(int argc, char** argv, int start_index) {
       out.flags[key] = value;
       continue;
     }
-    if (token.rfind("-", 0) == 0 && token.size() == 2) {
+    if (token.rfind("-", 0) == 0 && token.size() > 1 && token[1] != '-') {
       if (i + 1 >= argc) {
         throw std::runtime_error("Flag requires a value: " + token);
       }
-      const std::string key(1, token[1]);
+      const std::string key = token.substr(1);
       out.flags[key] = argv[++i];
       continue;
     }
@@ -435,6 +438,218 @@ std::vector<std::string> load_dataset_lines(const std::string& path) {
   return lines;
 }
 
+std::vector<std::string> parse_csv_row(const std::string& line) {
+  std::vector<std::string> out;
+  std::string cur;
+  bool in_quotes = false;
+  for (size_t i = 0; i < line.size(); ++i) {
+    const char c = line[i];
+    if (c == '"') {
+      if (in_quotes && i + 1 < line.size() && line[i + 1] == '"') {
+        cur.push_back('"');
+        ++i;
+      } else {
+        in_quotes = !in_quotes;
+      }
+      continue;
+    }
+    if (c == ',' && !in_quotes) {
+      out.push_back(cur);
+      cur.clear();
+      continue;
+    }
+    cur.push_back(c);
+  }
+  out.push_back(cur);
+  return out;
+}
+
+struct SentenceCsvRow {
+  std::string sentence;
+  std::string k_text;
+  std::string r_text;
+  std::string v_text;
+};
+
+std::vector<SentenceCsvRow>
+load_sentence_krv_csv_rows(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) {
+    throw std::runtime_error("Failed to open sentence database CSV: " + path);
+  }
+
+  std::vector<SentenceCsvRow> rows;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (line.empty()) {
+      continue;
+    }
+    const std::vector<std::string> cols = parse_csv_row(line);
+    if (cols.size() < 4) {
+      continue;
+    }
+    if (rows.empty() && to_lower(cols[0]) == "sentence") {
+      continue;
+    }
+    SentenceCsvRow ex;
+    ex.sentence = cols[0];
+    ex.k_text = cols[1];
+    ex.r_text = cols[2];
+    ex.v_text = cols[3];
+    rows.push_back(std::move(ex));
+  }
+
+  if (rows.empty()) {
+    throw std::runtime_error("Sentence database CSV has no valid rows: " + path);
+  }
+  return rows;
+}
+
+float fp16_to_float(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  const uint32_t exp = (h >> 10) & 0x1Fu;
+  const uint32_t frac = h & 0x03FFu;
+
+  uint32_t bits = 0;
+  if (exp == 0) {
+    if (frac == 0) {
+      bits = sign;
+    } else {
+      int e = -14;
+      uint32_t f = frac;
+      while ((f & 0x0400u) == 0) {
+        f <<= 1;
+        --e;
+      }
+      f &= 0x03FFu;
+      bits = sign | (static_cast<uint32_t>(e + 127) << 23) | (f << 13);
+    }
+  } else if (exp == 31) {
+    bits = sign | 0x7F800000u | (frac << 13);
+  } else {
+    bits = sign | ((exp - 15 + 127) << 23) | (frac << 13);
+  }
+
+  float out = 0.0f;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
+uint16_t read_u16_le(std::istream& in) {
+  uint8_t b[2] = {0, 0};
+  in.read(reinterpret_cast<char*>(b), 2);
+  return static_cast<uint16_t>(static_cast<uint16_t>(b[0])
+      | (static_cast<uint16_t>(b[1]) << 8));
+}
+
+uint64_t read_u64_le(std::istream& in) {
+  uint8_t b[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  in.read(reinterpret_cast<char*>(b), 8);
+  uint64_t v = 0;
+  for (size_t i = 0; i < 8; ++i) {
+    v |= (static_cast<uint64_t>(b[i]) << (8 * i));
+  }
+  return v;
+}
+
+struct KRVEmbeddingRecord {
+  std::vector<float> k;
+  std::vector<float> r;
+  std::vector<float> v;
+};
+
+std::vector<KRVEmbeddingRecord> load_krv_embedding_database(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    throw std::runtime_error("Failed to open KRV database: " + path);
+  }
+
+  constexpr uint64_t kMagic = 0x4B5256454D424544ULL; // KRVEMBED
+  const uint64_t magic = read_u64_le(in);
+  if (!in || magic != kMagic) {
+    throw std::runtime_error("Invalid KRV database magic in: " + path);
+  }
+
+  const uint16_t k_len = read_u16_le(in);
+  const uint16_t r_len = read_u16_le(in);
+  const uint16_t v_len = read_u16_le(in);
+  (void)read_u16_le(in); // padding
+  if (!in || k_len == 0 || r_len == 0 || v_len == 0) {
+    throw std::runtime_error("Invalid KRV database header in: " + path);
+  }
+
+  std::vector<KRVEmbeddingRecord> rows;
+  while (true) {
+    KRVEmbeddingRecord rec;
+    rec.k.resize(k_len);
+    rec.r.resize(r_len);
+    rec.v.resize(v_len);
+
+    bool ok = true;
+    for (size_t i = 0; i < k_len; ++i) {
+      if (!in.good()) { ok = false; break; }
+      rec.k[i] = fp16_to_float(read_u16_le(in));
+    }
+    for (size_t i = 0; ok && i < r_len; ++i) {
+      if (!in.good()) { ok = false; break; }
+      rec.r[i] = fp16_to_float(read_u16_le(in));
+    }
+    for (size_t i = 0; ok && i < v_len; ++i) {
+      if (!in.good()) { ok = false; break; }
+      rec.v[i] = fp16_to_float(read_u16_le(in));
+    }
+
+    if (!ok) {
+      break;
+    }
+    rows.push_back(std::move(rec));
+  }
+
+  if (rows.empty()) {
+    throw std::runtime_error("KRV database contains no embedding rows: " + path);
+  }
+  return rows;
+}
+
+std::vector<float> sentence_embedding_hash(const std::string& text, size_t dim) {
+  std::vector<float> out(dim, 0.0f);
+  if (dim == 0 || text.empty()) {
+    return out;
+  }
+
+  for (size_t i = 0; i < text.size(); ++i) {
+    const uint32_t c = static_cast<uint8_t>(text[i]);
+    const uint32_t h1 = 2166136261u ^ (c + static_cast<uint32_t>(i * 131u));
+    const uint32_t h2 = (h1 * 16777619u) ^ (c * 1315423911u);
+    const size_t idx1 = static_cast<size_t>(h1 % static_cast<uint32_t>(dim));
+    const size_t idx2 = static_cast<size_t>(h2 % static_cast<uint32_t>(dim));
+    out[idx1] += 1.0f;
+    out[idx2] -= 0.5f;
+  }
+
+  float n2 = 0.0f;
+  for (float v : out) {
+    n2 += v * v;
+  }
+  const float n = std::sqrt(std::max(1e-12f, n2));
+  for (float& v : out) {
+    v /= n;
+  }
+  return out;
+}
+
+std::vector<float> fit_embedding_dim(const std::vector<float>& in, size_t dim) {
+  std::vector<float> out(dim, 0.0f);
+  const size_t n = std::min(dim, in.size());
+  for (size_t i = 0; i < n; ++i) {
+    out[i] = in[i];
+  }
+  return out;
+}
+
 // Remove spaces that appear immediately before punctuation characters.
 std::string strip_spaces_before_punct(const std::string& s) {
   static const std::string punct = ".!?,;:'\")]}";
@@ -474,7 +689,8 @@ void write_memory_module_from_dataset(
   llm::memory::MultiHopQuery query(graph, spatial_map, mem_cfg);
 
   llm::arch::KVState recurrent_state;
-  llm::arch::AttentionMemory kv_cache;
+  llm::arch::AttentionMemory chrono_kv_cache;
+  llm::arch::AttentionMemory krv_cache;
 
   constexpr bool kForceOutput = false;
   constexpr bool kEnableQuery = true;
@@ -490,7 +706,8 @@ void write_memory_module_from_dataset(
       (void)model_copy.step_with_trace(
           ex.input[i],
           recurrent_state,
-          kv_cache,
+          chrono_kv_cache,
+          krv_cache,
           bridge,
           query,
           kForceOutput,
@@ -560,6 +777,14 @@ void print_usage(const char* program) {
       << "  --samples-per-epoch N         Random samples per epoch (0 = use all)\n"
       << "  --force-query-prob F          Probability of forcing first inner step to QUERY_MEMORY\n"
       << "  --load-gate-supervision-weight F Weight for memory-load gate supervision\n"
+      << "  --enable-action-renorm BOOL   Continuously renormalize action levels during training\n"
+      << "  --target-queries-per-output F Target avg queries per emitted char (default: 0.05)\n"
+      << "  --target-creates-per-output F Target avg memory creates per emitted char (default: 0.02)\n"
+      << "  --action-renorm-gain F        Controller gain for adaptive action renormalization\n"
+      << "  --action-renorm-max-bias F    Clamp for per-action renormalization bias\n"
+      << "  -s, --s-database PATH         CSV sentence database (cols: sentence,K,R,V)\n"
+      << "  -krv, --krv-database PATH     Binary KRV embedding DB aligned by sentence index\n"
+      << "  --sentence-krv-loss-weight F  Weight for sentence->KRV alignment objective\n"
       << "  --group-min-sentences N       Min sentences per training sample (default: 3)\n"
       << "  --group-max-sentences N       Max sentences per training sample (default: 5)\n"
       << "  --group-seed N                RNG seed for sentence grouping (default: 0)\n"
@@ -590,6 +815,11 @@ int run_train_command(const ParsedArgs& args) {
 
   const std::string input_path = get_flag(args, "input", "i");
   const std::string memory_module_path = get_memory_module_flag(args);
+  const std::string s_database_path = get_flag(args, "s-database", "s");
+  const std::string krv_database_path = get_flag(args, "krv-database", "krv");
+  if (!krv_database_path.empty() && s_database_path.empty()) {
+    throw std::runtime_error("-krv/--krv-database requires -s/--s-database");
+  }
 
   LoopConfig model_cfg;
   if (has_flag(args, "char-vocab")) {
@@ -723,6 +953,24 @@ int run_train_command(const ParsedArgs& args) {
   if (has_flag(args, "load-gate-supervision-weight")) {
     train_cfg.load_gate_supervision_weight = parse_float(get_flag(args, "load-gate-supervision-weight"), "load-gate-supervision-weight");
   }
+  if (has_flag(args, "enable-action-renorm")) {
+    train_cfg.enable_action_renorm = parse_bool(get_flag(args, "enable-action-renorm"));
+  }
+  if (has_flag(args, "target-queries-per-output")) {
+    train_cfg.target_queries_per_output = parse_float(get_flag(args, "target-queries-per-output"), "target-queries-per-output");
+  }
+  if (has_flag(args, "target-creates-per-output")) {
+    train_cfg.target_memory_creates_per_output = parse_float(get_flag(args, "target-creates-per-output"), "target-creates-per-output");
+  }
+  if (has_flag(args, "action-renorm-gain")) {
+    train_cfg.action_renorm_gain = parse_float(get_flag(args, "action-renorm-gain"), "action-renorm-gain");
+  }
+  if (has_flag(args, "action-renorm-max-bias")) {
+    train_cfg.action_renorm_max_bias = parse_float(get_flag(args, "action-renorm-max-bias"), "action-renorm-max-bias");
+  }
+  if (has_flag(args, "sentence-krv-loss-weight")) {
+    train_cfg.sentence_krv_loss_weight = parse_float(get_flag(args, "sentence-krv-loss-weight"), "sentence-krv-loss-weight");
+  }
 
   if (has_flag(args, "memory-semvec-dim")) {
     train_cfg.memory_cfg.semvec_dim = parse_size(get_flag(args, "memory-semvec-dim"), "memory-semvec-dim");
@@ -739,6 +987,37 @@ int run_train_command(const ParsedArgs& args) {
 
   if (has_flag(args, "focal-gamma")) {
     train_cfg.focal_gamma = parse_float(get_flag(args, "focal-gamma"), "focal-gamma");
+  }
+
+  if (!s_database_path.empty()) {
+    const std::vector<SentenceCsvRow> sentence_rows = load_sentence_krv_csv_rows(s_database_path);
+    std::vector<KRVEmbeddingRecord> krv_rows;
+    if (!krv_database_path.empty()) {
+      krv_rows = load_krv_embedding_database(krv_database_path);
+      if (krv_rows.size() != sentence_rows.size()) {
+        throw std::runtime_error(
+            "KRV database row count does not match sentence database row count");
+      }
+    }
+
+    train_cfg.sentence_krv_examples.clear();
+    train_cfg.sentence_krv_examples.reserve(sentence_rows.size());
+    for (size_t i = 0; i < sentence_rows.size(); ++i) {
+      llm::training::looping::SentenceKRVExample ex;
+      ex.sentence = sentence_rows[i].sentence;
+      if (!krv_rows.empty()) {
+        ex.key_embedding = fit_embedding_dim(krv_rows[i].k, model.config().qk_dim);
+        ex.relation_embedding = fit_embedding_dim(krv_rows[i].r, model.config().rel_dim);
+        ex.value_embedding = fit_embedding_dim(krv_rows[i].v, model.config().v_dim);
+      } else {
+        ex.key_embedding = sentence_embedding_hash(sentence_rows[i].k_text, model.config().qk_dim);
+        ex.relation_embedding = sentence_embedding_hash(sentence_rows[i].r_text, model.config().rel_dim);
+        ex.value_embedding = sentence_embedding_hash(sentence_rows[i].v_text, model.config().v_dim);
+      }
+      train_cfg.sentence_krv_examples.push_back(std::move(ex));
+    }
+    std::cout << "Loaded sentence->KRV alignment examples: "
+              << train_cfg.sentence_krv_examples.size() << "\n";
   }
 
   const std::vector<std::string> raw_lines = load_dataset_lines(dataset_path);
@@ -826,7 +1105,8 @@ int run_infer_command(const ParsedArgs& args) {
   }
 
   llm::arch::KVState recurrent_state;
-  llm::arch::AttentionMemory kv_cache;
+  llm::arch::AttentionMemory chrono_kv_cache;
+  llm::arch::AttentionMemory krv_cache;
 
   char current = prompt.empty() ? ' ' : prompt.back();
   // BackpropFull trains with a single recurrent step and no KV-cache accumulation
@@ -842,7 +1122,8 @@ int run_infer_command(const ParsedArgs& args) {
     const auto step = model.step_with_trace(
         c,
         recurrent_state,
-        kv_cache,
+      chrono_kv_cache,
+      krv_cache,
         bridge,
         query,
         force_output,
@@ -860,7 +1141,8 @@ int run_infer_command(const ParsedArgs& args) {
     const auto step = model.step_with_trace(
         current,
         recurrent_state,
-        kv_cache,
+      chrono_kv_cache,
+      krv_cache,
         bridge,
         query,
         force_output,

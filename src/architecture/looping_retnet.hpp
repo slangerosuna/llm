@@ -6,11 +6,13 @@
 //   • A RetNet recurrent core (recurrent mode, one step per character).
 //   • An Attention module used *only* to read from long-term graph memory via
 //     AttentionMemory (not for in-sequence context).
-//   • A 3-class action head that chooses on every inner iteration:
+//   • A 4-class action head that chooses on every inner iteration:
 //       0 – OUTPUT:        emit a character and advance to the next input token.
 //       1 – QUERY_MEMORY:  run a multihop graph query, inject results into the
-//                          KV cache, and loop again (no output yet).
+//                          retentive KRV cache, and loop again (no output yet).
 //       2 – LOOP:          run the RetNet core again without querying or outputting.
+//       3 – CREATE_MEMORY: generate a new memory tuple from a dedicated LM head,
+//                          inject into KRV + graph, then loop again.
 //
 // The model loops until it selects OUTPUT or exhausts max_steps, at which point
 // it is forced to output.  This lets it perform up to max_steps-1 "thinking"
@@ -22,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -38,7 +41,21 @@ namespace llm::arch {
 
 // ── Model action enum ─────────────────────────────────────────────────────────
 
-enum class ModelAction : uint8_t { OUTPUT = 0, QUERY_MEMORY = 1, LOOP = 2 };
+enum class ModelAction : uint8_t {
+    OUTPUT = 0,
+    QUERY_MEMORY = 1,
+    LOOP = 2,
+    CREATE_MEMORY = 3,
+};
+
+struct ActionControl {
+    bool enabled = false;
+    float output_bias = 0.0f;
+    float query_bias = 0.0f;
+    float loop_bias = 0.0f;
+    float create_bias = 0.0f;
+    bool force_create_memory_first = false;
+};
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -100,20 +117,27 @@ class LoopingRetNet {
     // Optional hidden stack over fused state before heads.
     std::vector<LinearProj> hidden_layers_;
 
-    // 3-class action head.
-    LinearProj action_head_; // v_dim → 3
+    // 4-class action head.
+    LinearProj action_head_; // v_dim → 4
 
     // Query-load gate head.
     LinearProj load_head_; // v_dim → 1
+
+    // Dual-attention mixing heads and memory generation/ordering heads.
+    LinearProj chrono_mix_head_;   // v_dim -> 1
+    LinearProj krv_mix_head_;      // v_dim -> 1
+    LinearProj memory_entry_head_; // v_dim -> (qk_dim + rel_dim + v_dim)
+    LinearProj krv_order_head_;    // v_dim -> 1
 
     // Character output head.
     LinearProj output_head_; // v_dim → char_vocab
     Scalar output_theta_ = static_cast<Scalar>(1.0f);
 
-    Attention attention_;
+    Attention chrono_attention_;
+    Attention krv_attention_;
 
     static constexpr uint32_t kModelMagic = 0x4C524E54; // "LRNT"
-    static constexpr uint32_t kModelVersion = 3;
+    static constexpr uint32_t kModelVersion = 4;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -123,7 +147,7 @@ class LoopingRetNet {
 
     ModelAction pick_action(const Vector& state) const {
         const Vector logits = action_head_.forward(state);
-        if (logits.size() < 3) { return ModelAction::OUTPUT; }
+        if (logits.size() < 4) { return ModelAction::OUTPUT; }
 
         // Stable softmax → argmax.
         float m = static_cast<float>(logits[0]);
@@ -155,13 +179,21 @@ class LoopingRetNet {
     }
 
     // Fuse RetNet output and attention output into a single state vector.
-    // Both are v_dim; output is v_dim.
-    static Vector fuse(const Vector& ret, const Vector& attn) {
-        const size_t dim = std::min(ret.size(), attn.size());
+    // Both attention vectors are v_dim; output is v_dim.
+    static Vector fuse_dual(
+        const Vector& ret,
+        const Vector& chrono_attn,
+        const Vector& krv_attn,
+        float chrono_mix,
+        float krv_mix)
+    {
+        const size_t dim = std::min(ret.size(), std::min(chrono_attn.size(), krv_attn.size()));
         Vector out(dim, static_cast<Scalar>(0.0f));
         for (size_t i = 0; i < dim; ++i) {
             out[i] = static_cast<Scalar>(
-                static_cast<float>(ret[i]) + static_cast<float>(attn[i]));
+                static_cast<float>(ret[i])
+                + chrono_mix * static_cast<float>(chrono_attn[i])
+                + krv_mix * static_cast<float>(krv_attn[i]));
         }
         return out;
     }
@@ -169,6 +201,118 @@ class LoopingRetNet {
     static Vector swiglu_self(const Vector& x) {
         // Self-gated SwiGLU block for unified non-final activations.
         return activation::swiglu(x, x);
+    }
+
+    static float sigmoid(float x) {
+        return 1.0f / (1.0f + std::exp(-x));
+    }
+
+    static Vector relation_zeros(size_t rel_dim) {
+        return Vector(rel_dim, static_cast<Scalar>(0.0f));
+    }
+
+    static AttentionMemory evict_to_size(AttentionMemory& mem, size_t max_entries) {
+        AttentionMemory evicted;
+        if (max_entries == 0 || mem.size() <= max_entries) {
+            if (max_entries == 0 && !mem.empty()) {
+                evicted = std::move(mem);
+                mem = AttentionMemory{};
+            }
+            return evicted;
+        }
+
+        const size_t n = mem.size();
+        std::vector<size_t> keep(n);
+        for (size_t i = 0; i < n; ++i) {
+            keep[i] = i;
+        }
+        std::partial_sort(
+            keep.begin(),
+            keep.begin() + static_cast<std::ptrdiff_t>(max_entries),
+            keep.end(),
+            [&](size_t a, size_t b) {
+                const float score_a = (a < mem.prune_scores.size())
+                    ? mem.prune_scores[a]
+                    : std::numeric_limits<float>::infinity();
+                const float score_b = (b < mem.prune_scores.size())
+                    ? mem.prune_scores[b]
+                    : std::numeric_limits<float>::infinity();
+                if (score_a != score_b) {
+                    return score_a < score_b;
+                }
+                return a > b;
+            });
+
+        std::vector<uint8_t> keep_mask(n, 0);
+        for (size_t i = 0; i < max_entries; ++i) {
+            keep_mask[keep[i]] = 1;
+        }
+
+        AttentionMemory kept;
+        kept.keys.reserve(max_entries);
+        kept.relations.reserve(max_entries);
+        kept.values.reserve(max_entries);
+        kept.prune_scores.reserve(max_entries);
+
+        for (size_t i = 0; i < n; ++i) {
+            if (keep_mask[i]) {
+                kept.keys.push_back(std::move(mem.keys[i]));
+                kept.relations.push_back(std::move(mem.relations[i]));
+                kept.values.push_back(std::move(mem.values[i]));
+                kept.prune_scores.push_back(mem.prune_scores[i]);
+            } else {
+                evicted.keys.push_back(std::move(mem.keys[i]));
+                evicted.relations.push_back(std::move(mem.relations[i]));
+                evicted.values.push_back(std::move(mem.values[i]));
+                evicted.prune_scores.push_back(mem.prune_scores[i]);
+            }
+        }
+
+        mem = std::move(kept);
+        return evicted;
+    }
+
+    static void append_memory(AttentionMemory& dst, AttentionMemory&& src) {
+        for (size_t i = 0; i < src.size(); ++i) {
+            dst.push_back(
+                std::move(src.keys[i]),
+                std::move(src.relations[i]),
+                std::move(src.values[i]),
+                src.prune_scores[i]);
+        }
+    }
+
+    void prune_krv_cache_with_graph_write(
+        AttentionMemory& krv_cache,
+        memory::GraphMemoryBridge& bridge,
+        bool enable_memory_write) const
+    {
+        const AttentionMemory evicted = evict_to_size(krv_cache, kv_cache_limit());
+        if (enable_memory_write && !evicted.empty()) {
+            bridge.write(evicted);
+        }
+    }
+
+    static void prune_chrono_cache(AttentionMemory& chrono_cache, size_t max_entries) {
+        if (max_entries == 0 || chrono_cache.size() <= max_entries) {
+            if (max_entries == 0) {
+                chrono_cache = AttentionMemory{};
+            }
+            return;
+        }
+        const size_t remove_n = chrono_cache.size() - max_entries;
+        chrono_cache.keys.erase(
+            chrono_cache.keys.begin(),
+            chrono_cache.keys.begin() + static_cast<std::ptrdiff_t>(remove_n));
+        chrono_cache.relations.erase(
+            chrono_cache.relations.begin(),
+            chrono_cache.relations.begin() + static_cast<std::ptrdiff_t>(remove_n));
+        chrono_cache.values.erase(
+            chrono_cache.values.begin(),
+            chrono_cache.values.begin() + static_cast<std::ptrdiff_t>(remove_n));
+        chrono_cache.prune_scores.erase(
+            chrono_cache.prune_scores.begin(),
+            chrono_cache.prune_scores.begin() + static_cast<std::ptrdiff_t>(remove_n));
     }
 
     size_t kv_cache_limit() const {
@@ -268,7 +412,7 @@ class LoopingRetNet {
 
 public:
     explicit LoopingRetNet(const LoopConfig& cfg, uint32_t seed = 42)
-        : cfg_(cfg), attention_(0.8f)
+        : cfg_(cfg), chrono_attention_(0.8f), krv_attention_(0.8f)
     {
         std::mt19937 rng(seed);
         const float s = 0.02f;
@@ -293,8 +437,12 @@ public:
         for (size_t i = 0; i < cfg.hidden_layers; ++i) {
             hidden_layers_.emplace_back(cfg.v_dim, cfg.v_dim, s, rng);
         }
-        action_head_= LinearProj(cfg.v_dim,     3,             s, rng);
+        action_head_= LinearProj(cfg.v_dim,     4,             s, rng);
         load_head_  = LinearProj(cfg.v_dim,     1,             s, rng);
+        chrono_mix_head_ = LinearProj(cfg.v_dim, 1,            s, rng);
+        krv_mix_head_ = LinearProj(cfg.v_dim,    1,            s, rng);
+        memory_entry_head_ = LinearProj(cfg.v_dim, cfg.qk_dim + cfg.rel_dim + cfg.v_dim, s, rng);
+        krv_order_head_ = LinearProj(cfg.v_dim,  1,            s, rng);
         output_head_= LinearProj(cfg.v_dim,     cfg.char_vocab, s, rng);
         output_theta_ = static_cast<Scalar>(1.0f);
     }
@@ -341,6 +489,10 @@ public:
         }
         write_linear(os, action_head_);
         write_linear(os, load_head_);
+        write_linear(os, chrono_mix_head_);
+        write_linear(os, krv_mix_head_);
+        write_linear(os, memory_entry_head_);
+        write_linear(os, krv_order_head_);
         write_linear(os, output_head_);
         os.write(reinterpret_cast<const char*>(&output_theta_), sizeof(output_theta_));
 
@@ -360,7 +512,7 @@ public:
         if (magic != kModelMagic) {
             throw std::runtime_error("LoopingRetNet load: invalid file magic");
         }
-        if (version != 1 && version != 2 && version != kModelVersion) {
+        if (version != 1 && version != 2 && version != 3 && version != kModelVersion) {
             throw std::runtime_error("LoopingRetNet load: unsupported version");
         }
 
@@ -406,6 +558,21 @@ public:
             model.cfg_.hidden_layers = 0;
         }
         model.action_head_ = read_linear(is);
+        if (model.action_head_.out_dim == 3) {
+            LinearProj expanded;
+            expanded.in_dim = cfg.v_dim;
+            expanded.out_dim = 4;
+            expanded.w.assign(expanded.in_dim * expanded.out_dim, static_cast<Scalar>(0.0f));
+            expanded.b.assign(expanded.out_dim, static_cast<Scalar>(0.0f));
+            for (size_t o = 0; o < 3; ++o) {
+                expanded.b[o] = model.action_head_.b[o];
+                for (size_t i = 0; i < expanded.in_dim; ++i) {
+                    expanded.w[o * expanded.in_dim + i] =
+                        model.action_head_.w[o * expanded.in_dim + i];
+                }
+            }
+            model.action_head_ = std::move(expanded);
+        }
         if (version >= 3) {
             model.load_head_ = read_linear(is);
         } else {
@@ -413,6 +580,36 @@ public:
             model.load_head_.out_dim = 1;
             model.load_head_.w.assign(cfg.v_dim, static_cast<Scalar>(0.0f));
             model.load_head_.b.assign(1, static_cast<Scalar>(4.0f));
+        }
+        if (version >= 4) {
+            model.chrono_mix_head_ = read_linear(is);
+            model.krv_mix_head_ = read_linear(is);
+            model.memory_entry_head_ = read_linear(is);
+            model.krv_order_head_ = read_linear(is);
+        } else {
+            model.chrono_mix_head_.in_dim = cfg.v_dim;
+            model.chrono_mix_head_.out_dim = 1;
+            model.chrono_mix_head_.w.assign(cfg.v_dim, static_cast<Scalar>(0.0f));
+            model.chrono_mix_head_.b.assign(1, static_cast<Scalar>(0.0f));
+
+            model.krv_mix_head_.in_dim = cfg.v_dim;
+            model.krv_mix_head_.out_dim = 1;
+            model.krv_mix_head_.w.assign(cfg.v_dim, static_cast<Scalar>(0.0f));
+            model.krv_mix_head_.b.assign(1, static_cast<Scalar>(0.0f));
+
+            model.memory_entry_head_.in_dim = cfg.v_dim;
+            model.memory_entry_head_.out_dim = cfg.qk_dim + cfg.rel_dim + cfg.v_dim;
+            model.memory_entry_head_.w.assign(
+                model.memory_entry_head_.in_dim * model.memory_entry_head_.out_dim,
+                static_cast<Scalar>(0.0f));
+            model.memory_entry_head_.b.assign(
+                model.memory_entry_head_.out_dim,
+                static_cast<Scalar>(0.0f));
+
+            model.krv_order_head_.in_dim = cfg.v_dim;
+            model.krv_order_head_.out_dim = 1;
+            model.krv_order_head_.w.assign(cfg.v_dim, static_cast<Scalar>(0.0f));
+            model.krv_order_head_.b.assign(1, static_cast<Scalar>(0.0f));
         }
         model.output_head_ = read_linear(is);
         is.read(reinterpret_cast<char*>(&model.output_theta_), sizeof(model.output_theta_));
@@ -452,6 +649,10 @@ public:
         }
         h = hash_linear(h, action_head_);
         h = hash_linear(h, load_head_);
+        h = hash_linear(h, chrono_mix_head_);
+        h = hash_linear(h, krv_mix_head_);
+        h = hash_linear(h, memory_entry_head_);
+        h = hash_linear(h, krv_order_head_);
         h = hash_linear(h, output_head_);
         h = fnv1a_u64(h, static_cast<uint64_t>(static_cast<float>(output_theta_) * 1000000.0f));
         return h;
@@ -478,6 +679,10 @@ public:
         }
         total += action_head_.w.size() + action_head_.b.size();
         total += load_head_.w.size() + load_head_.b.size();
+        total += chrono_mix_head_.w.size() + chrono_mix_head_.b.size();
+        total += krv_mix_head_.w.size() + krv_mix_head_.b.size();
+        total += memory_entry_head_.w.size() + memory_entry_head_.b.size();
+        total += krv_order_head_.w.size() + krv_order_head_.b.size();
         total += output_head_.w.size() + output_head_.b.size();
         total += 1;
 
@@ -505,6 +710,10 @@ public:
         }
         append_linear(action_head_);
         append_linear(load_head_);
+        append_linear(chrono_mix_head_);
+        append_linear(krv_mix_head_);
+        append_linear(memory_entry_head_);
+        append_linear(krv_order_head_);
         append_linear(output_head_);
         flat.push_back(output_theta_);
 
@@ -544,6 +753,10 @@ public:
         }
         append_linear(action_head_);
         append_linear(load_head_);
+        append_linear(chrono_mix_head_);
+        append_linear(krv_mix_head_);
+        append_linear(memory_entry_head_);
+        append_linear(krv_order_head_);
         append_linear(output_head_);
 
         refs.push_back(&output_theta_);
@@ -574,6 +787,10 @@ public:
         }
         add_linear(action_head_);
         add_linear(load_head_);
+        add_linear(chrono_mix_head_);
+        add_linear(krv_mix_head_);
+        add_linear(memory_entry_head_);
+        add_linear(krv_order_head_);
         add_linear(output_head_);
         return total;
     }
@@ -614,6 +831,10 @@ public:
         }
         load_linear(action_head_);
         load_linear(load_head_);
+        load_linear(chrono_mix_head_);
+        load_linear(krv_mix_head_);
+        load_linear(memory_entry_head_);
+        load_linear(krv_order_head_);
         load_linear(output_head_);
 
         if (idx + 1 > flat.size()) {
@@ -637,9 +858,15 @@ public:
         char   output_char;
         size_t inner_steps_taken;
         size_t query_count;
+        size_t generated_memory_count;
+        bool has_generated_memory;
         Vector logits;
         Vector raw_logits;
         Vector final_state;
+        Vector generated_memory_state;
+        Vector generated_key;
+        Vector generated_relation;
+        Vector generated_value;
         std::vector<Vector> per_step_output_logits;
         std::vector<Vector> per_step_action_logits;
         std::vector<Vector> per_step_states;
@@ -650,8 +877,10 @@ public:
     // Processes one input character token.
     //
     // recurrent_state: KVState carrying the RetNet hidden state (read+write).
-    // kv_cache:        AttentionMemory used solely to bridge graph ↔ RetNet.
-    //                  Accumulated across tokens; caller can prune it.
+    // chrono_kv_cache: Chronologically ordered in-sequence KV attention cache;
+    //                  aggressively pruned and never written to long-term graph.
+    // krv_cache:       Retentive KRV cache; interacts with graph and evicted
+    //                  entries are written back to long-term memory.
     // bridge:          Writes active KV entries into the long-term graph.
     // query_engine:    Performs multihop graph lookups on demand.
     //
@@ -659,7 +888,8 @@ public:
     StepTrace step_with_trace(
         char                      input_char,
         KVState&                  recurrent_state,
-        AttentionMemory&          kv_cache,
+        AttentionMemory&          chrono_kv_cache,
+        AttentionMemory&          krv_cache,
         memory::GraphMemoryBridge& bridge,
         memory::MultiHopQuery&    query_engine,
         bool                      force_output = false,
@@ -667,13 +897,20 @@ public:
         size_t                    forced_loop_count = 0,
         bool                      use_parallel_retention = false,
         bool                      enable_memory_write = true,
-        bool                      force_query_first = false)
+        bool                      force_query_first = false,
+        const ActionControl*      action_control = nullptr)
     {
         // x starts as the character embedding and may be overridden to the
         // fused-state loop projection on subsequent inner steps.
         Vector x = embed(input_char);
 
         size_t query_count = 0;
+        size_t generated_memory_count = 0;
+        bool has_generated_memory = false;
+        Vector generated_memory_state;
+        Vector generated_key;
+        Vector generated_relation;
+        Vector generated_value;
         Matrix q_hist;
         Matrix k_hist;
         Matrix v_hist;
@@ -718,37 +955,84 @@ public:
                 recurrent_state = std::move(new_state);
             }
 
-            // ── Attention over KV cache (graph bridge only) ───────────────
-            // Build a one-entry current AttentionMemory for this step.
-            AttentionMemory current;
-            current.push_back(k, r, v, /*prune_score=*/0.0f);
+            // ── Dual attention heads ──────────────────────────────────────
+            AttentionMemory current_chrono;
+            current_chrono.push_back(k, relation_zeros(cfg_.rel_dim), v, /*prune_score=*/0.0f);
 
-            const Matrix attn_out = attention_.compute(Matrix{q}, current, kv_cache);
-            const Vector attn_vec = attn_out.empty() ? ret_out : attn_out.front();
+            AttentionMemory current_krv;
+            current_krv.push_back(k, r, v, /*prune_score=*/0.0f);
+
+            const Matrix chrono_attn_out = chrono_attention_.compute(Matrix{q}, current_chrono, chrono_kv_cache);
+            const Matrix krv_attn_out = krv_attention_.compute(Matrix{q}, current_krv, krv_cache);
+            const Vector chrono_attn_vec = chrono_attn_out.empty() ? ret_out : chrono_attn_out.front();
+            const Vector krv_attn_vec = krv_attn_out.empty() ? ret_out : krv_attn_out.front();
+
+            const float chrono_mix = sigmoid(static_cast<float>(chrono_mix_head_.forward(ret_out)[0]));
+            const float krv_mix = sigmoid(static_cast<float>(krv_mix_head_.forward(ret_out)[0]));
 
             // ── Fuse ─────────────────────────────────────────────────────
-            Vector state = fuse(ret_out, attn_vec);
+            Vector state = fuse_dual(ret_out, chrono_attn_vec, krv_attn_vec, chrono_mix, krv_mix);
             state = apply_hidden_stack(state);
 
-            // ── Write current entry to graph and accumulate in kv_cache ──
+            // ── Update dual caches and write to graph where applicable ───
+            chrono_kv_cache.push_back(k, relation_zeros(cfg_.rel_dim), v, /*prune_score=*/0.0f);
+            prune_chrono_cache(chrono_kv_cache, kv_cache_limit());
+
             if (enable_memory_write) {
-                bridge.write(current);
-                kv_cache.push_back(k, r, v, /*prune_score=*/0.0f);
-                kv_cache.prune_to_max(kv_cache_limit());
+                const float order_importance = sigmoid(static_cast<float>(krv_order_head_.forward(state)[0]));
+                const float prune_score = 1.0f - order_importance;
+                AttentionMemory current_write;
+                current_write.push_back(k, r, v, prune_score);
+                bridge.write(current_write);
+                krv_cache.push_back(k, r, v, prune_score);
+                prune_krv_cache_with_graph_write(krv_cache, bridge, enable_memory_write);
             }
 
             // ── Action decision ───────────────────────────────────────────
             const bool last_step = (step_i == cfg_.max_steps - 1);
             Vector action_logits = action_head_.forward(state);
+            if (action_control && action_control->enabled && action_logits.size() >= 4) {
+                action_logits[0] = static_cast<Scalar>(
+                    static_cast<float>(action_logits[0]) + action_control->output_bias);
+                action_logits[1] = static_cast<Scalar>(
+                    static_cast<float>(action_logits[1]) + action_control->query_bias);
+                action_logits[2] = static_cast<Scalar>(
+                    static_cast<float>(action_logits[2]) + action_control->loop_bias);
+                action_logits[3] = static_cast<Scalar>(
+                    static_cast<float>(action_logits[3]) + action_control->create_bias);
+            }
             const Vector load_logits = load_head_.forward(state);
             const float load_logit = load_logits.empty() ? 0.0f : static_cast<float>(load_logits[0]);
-            ModelAction action = force_output ? ModelAction::OUTPUT : pick_action(state);
+            ModelAction action = ModelAction::OUTPUT;
+            if (!force_output) {
+                if (action_logits.size() >= 4) {
+                    float best = static_cast<float>(action_logits[0]);
+                    size_t best_i = 0;
+                    for (size_t ai = 1; ai < 4; ++ai) {
+                        const float av = static_cast<float>(action_logits[ai]);
+                        if (av > best) {
+                            best = av;
+                            best_i = ai;
+                        }
+                    }
+                    action = static_cast<ModelAction>(best_i);
+                } else {
+                    action = pick_action(state);
+                }
+            }
 
             if (forced_loops > 0) {
                 action = (step_i + 1 < forced_loops) ? ModelAction::LOOP : ModelAction::OUTPUT;
             }
             if (!force_output && force_query_first && enable_query && step_i == 0 && !last_step) {
                 action = ModelAction::QUERY_MEMORY;
+            }
+            if (!force_output
+                && action_control
+                && action_control->force_create_memory_first
+                && step_i == 0
+                && !last_step) {
+                action = ModelAction::CREATE_MEMORY;
             }
 
             const Vector raw_logits = output_head_.forward(state);
@@ -763,7 +1047,7 @@ public:
             if (last_step) { action = ModelAction::OUTPUT; }
 
             if (action == ModelAction::QUERY_MEMORY && enable_query) {
-                // Multihop graph query; add results to kv_cache with penalty.
+                // Multihop graph query; add results to KRV cache with penalty.
                 AttentionMemory queried = query_engine.query(q);
                 ++query_count;
                 if (!queried.empty()) {
@@ -771,16 +1055,51 @@ public:
                 }
                 const float load_prob = 1.0f / (1.0f + std::exp(-load_logit));
                 if (load_prob >= 0.5f) {
-                    for (size_t qi = 0; qi < queried.size(); ++qi) {
-                        kv_cache.push_back(
-                            std::move(queried.keys[qi]),
-                            std::move(queried.relations[qi]),
-                            std::move(queried.values[qi]),
-                            queried.prune_scores[qi]);
-                    }
-                    kv_cache.prune_to_max(kv_cache_limit());
+                    append_memory(krv_cache, std::move(queried));
+                    prune_krv_cache_with_graph_write(krv_cache, bridge, enable_memory_write);
                 }
                 // Loop again using the fused state projected back to model_dim.
+                x = activation::swiglu(loop_proj_.forward(state), loop_proj_.forward(state));
+                continue;
+            }
+
+            if (action == ModelAction::CREATE_MEMORY) {
+                const Vector mem_head = memory_entry_head_.forward(state);
+                const size_t k_dim = cfg_.qk_dim;
+                const size_t r_dim = cfg_.rel_dim;
+                const size_t v_dim = cfg_.v_dim;
+                if (mem_head.size() >= k_dim + r_dim + v_dim) {
+                    Vector mk(k_dim, static_cast<Scalar>(0.0f));
+                    Vector mr(r_dim, static_cast<Scalar>(0.0f));
+                    Vector mv(v_dim, static_cast<Scalar>(0.0f));
+                    for (size_t i = 0; i < k_dim; ++i) {
+                        mk[i] = mem_head[i];
+                    }
+                    for (size_t i = 0; i < r_dim; ++i) {
+                        mr[i] = mem_head[k_dim + i];
+                    }
+                    for (size_t i = 0; i < v_dim; ++i) {
+                        mv[i] = mem_head[k_dim + r_dim + i];
+                    }
+                    mk = swiglu_self(mk);
+                    mr = swiglu_self(mr);
+                    mv = swiglu_self(mv);
+                    has_generated_memory = true;
+                    generated_memory_state = state;
+                    generated_key = mk;
+                    generated_relation = mr;
+                    generated_value = mv;
+                    const float order_importance = sigmoid(static_cast<float>(krv_order_head_.forward(state)[0]));
+                    const float prune_score = 1.0f - order_importance;
+                    AttentionMemory generated;
+                    generated.push_back(std::move(mk), std::move(mr), std::move(mv), prune_score);
+                    if (enable_memory_write) {
+                        bridge.write(generated);
+                    }
+                    append_memory(krv_cache, std::move(generated));
+                    prune_krv_cache_with_graph_write(krv_cache, bridge, enable_memory_write);
+                    ++generated_memory_count;
+                }
                 x = activation::swiglu(loop_proj_.forward(state), loop_proj_.forward(state));
                 continue;
             }
@@ -796,9 +1115,15 @@ public:
             trace.output_char = pick_char(state);
             trace.inner_steps_taken = step_i + 1;
             trace.query_count = query_count;
+            trace.generated_memory_count = generated_memory_count;
+            trace.has_generated_memory = has_generated_memory;
             trace.logits = logits;
             trace.raw_logits = raw_logits;
             trace.final_state = state;
+            trace.generated_memory_state = std::move(generated_memory_state);
+            trace.generated_key = std::move(generated_key);
+            trace.generated_relation = std::move(generated_relation);
+            trace.generated_value = std::move(generated_value);
             trace.per_step_output_logits = std::move(all_output_logits);
             trace.per_step_action_logits = std::move(all_action_logits);
             trace.per_step_states = std::move(all_states);
@@ -814,14 +1139,16 @@ public:
     StepOutput step(
         char                      input_char,
         KVState&                  recurrent_state,
-        AttentionMemory&          kv_cache,
+        AttentionMemory&          chrono_kv_cache,
+        AttentionMemory&          krv_cache,
         memory::GraphMemoryBridge& bridge,
         memory::MultiHopQuery&    query_engine)
     {
         const StepTrace t = step_with_trace(
             input_char,
             recurrent_state,
-            kv_cache,
+            chrono_kv_cache,
+            krv_cache,
             bridge,
             query_engine,
             false,
@@ -829,7 +1156,8 @@ public:
             0,
             false,
             true,
-            false);
+            false,
+            nullptr);
         return {t.output_char, t.inner_steps_taken};
     }
 
@@ -907,6 +1235,30 @@ public:
 
     const std::vector<Scalar>& load_gate_bias() const {
         return load_head_.b;
+    }
+
+    size_t memory_entry_input_dim() const {
+        return memory_entry_head_.in_dim;
+    }
+
+    size_t memory_entry_output_dim() const {
+        return memory_entry_head_.out_dim;
+    }
+
+    std::vector<Scalar>& memory_entry_weights() {
+        return memory_entry_head_.w;
+    }
+
+    std::vector<Scalar>& memory_entry_bias() {
+        return memory_entry_head_.b;
+    }
+
+    const std::vector<Scalar>& memory_entry_weights() const {
+        return memory_entry_head_.w;
+    }
+
+    const std::vector<Scalar>& memory_entry_bias() const {
+        return memory_entry_head_.b;
     }
 
     size_t hidden_layer_count() const {

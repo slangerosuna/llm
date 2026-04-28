@@ -29,6 +29,13 @@ struct SequenceExample {
     std::string target;
 };
 
+struct SentenceKRVExample {
+    std::string sentence;
+    std::vector<float> key_embedding;
+    std::vector<float> relation_embedding;
+    std::vector<float> value_embedding;
+};
+
 enum class TrainMode : uint8_t {
     FiniteDifference = 0,
     BackpropHeads = 1,
@@ -102,6 +109,13 @@ struct TrainConfig {
     bool enable_query = true;
     bool use_parallel_retention = true;
 
+    // Adaptive action renormalization targets.
+    bool enable_action_renorm = true;
+    float target_queries_per_output = 0.05f;
+    float target_memory_creates_per_output = 0.02f;
+    float action_renorm_gain = 1.0f;
+    float action_renorm_max_bias = 3.0f;
+
     size_t forced_loop_min = 1;
     size_t forced_loop_max = 4;
 
@@ -137,6 +151,10 @@ struct TrainConfig {
     // Number of examples randomly sampled (with replacement) to estimate per-class p_t.
     // 0 means use the full dataset.
     size_t p_t_sampling_examples = 4096;
+
+    // Optional sentence->KRV embedding alignment training.
+    std::vector<SentenceKRVExample> sentence_krv_examples;
+    float sentence_krv_loss_weight = 1.0f;
 
     memory::MemoryConfig memory_cfg{};
 };
@@ -297,6 +315,67 @@ class LoopingRetNetSGDTrainer {
         return std::max(base_min,
             std::min(base_max, static_cast<size_t>(std::lround(interp))));
     }
+
+    struct ActionRenormController {
+        bool enabled = false;
+        size_t max_steps = 1;
+        float target_query_rate = 0.05f;
+        float target_create_rate = 0.02f;
+        float gain = 1.0f;
+        float max_bias = 3.0f;
+
+        size_t outputs = 0;
+        size_t total_queries = 0;
+        size_t total_creates = 0;
+        std::vector<size_t> loop_hist;
+
+        explicit ActionRenormController(
+            const TrainConfig& cfg,
+            size_t max_steps_in)
+            : enabled(cfg.enable_action_renorm),
+              max_steps(std::max<size_t>(1, max_steps_in)),
+              target_query_rate(std::max(0.0f, cfg.target_queries_per_output)),
+              target_create_rate(std::max(0.0f, cfg.target_memory_creates_per_output)),
+              gain(std::max(0.0f, cfg.action_renorm_gain)),
+              max_bias(std::max(0.0f, cfg.action_renorm_max_bias)),
+              loop_hist(max_steps + 1, 0) {}
+
+        arch::ActionControl control() const {
+            arch::ActionControl c;
+            c.enabled = enabled;
+            if (!enabled) {
+                return c;
+            }
+
+            const float out_count = std::max(1.0f, static_cast<float>(outputs));
+
+            const float target_per_bin = out_count / static_cast<float>(max_steps);
+            const float low_deficit = target_per_bin - static_cast<float>(loop_hist[1]);
+            const float high_deficit = target_per_bin - static_cast<float>(loop_hist[max_steps]);
+            const float loop_error = high_deficit - low_deficit;
+
+            const float observed_query = static_cast<float>(total_queries) / out_count;
+            const float observed_create = static_cast<float>(total_creates) / out_count;
+            const float query_error = target_query_rate - observed_query;
+            const float create_error = target_create_rate - observed_create;
+
+            c.loop_bias = std::clamp(gain * loop_error, -max_bias, max_bias);
+            c.output_bias = std::clamp(-0.5f * c.loop_bias, -max_bias, max_bias);
+            c.query_bias = std::clamp(gain * query_error, -max_bias, max_bias);
+            c.create_bias = std::clamp(gain * create_error, -max_bias, max_bias);
+            return c;
+        }
+
+        void update(const arch::LoopingRetNet::StepTrace& trace) {
+            ++outputs;
+            total_queries += trace.query_count;
+            total_creates += trace.generated_memory_count;
+            const size_t loops = std::clamp<size_t>(trace.inner_steps_taken, 1, max_steps);
+            if (loops < loop_hist.size()) {
+                ++loop_hist[loops];
+            }
+        }
+    };
 
     static std::vector<size_t> stratified_coordinate_indices(
         size_t param_count,
@@ -517,9 +596,12 @@ class LoopingRetNetSGDTrainer {
         }
 
         // Prefer QUERY on the first deferred decision when querying is enabled,
-        // then LOOP on later deferred decisions.
+        // then CREATE_MEMORY before LOOP on later deferred decisions.
         if (enable_query && decision_index == 0) {
             return static_cast<size_t>(llm::arch::ModelAction::QUERY_MEMORY);
+        }
+        if (decision_index == 1) {
+            return static_cast<size_t>(llm::arch::ModelAction::CREATE_MEMORY);
         }
         return static_cast<size_t>(llm::arch::ModelAction::LOOP);
     }
@@ -743,41 +825,35 @@ class LoopingRetNetSGDTrainer {
         }
 
         arch::KVState recurrent_state;
-        arch::AttentionMemory kv_cache;
+        arch::AttentionMemory chrono_kv_cache;
+        arch::AttentionMemory krv_cache;
 
         const bool memory_epoch_active = memory_active_for_epoch(epoch_1_based);
         const bool eff_enable_query = cfg_.enable_query && memory_epoch_active;
-        const size_t eff_loop_max_cfg = effective_forced_loop_max_for_epoch(epoch_1_based);
-
-        const size_t loop_min = std::max<size_t>(1, cfg_.forced_loop_min);
-        const size_t loop_max = std::max(loop_min,
-            std::min<size_t>(eff_loop_max_cfg, model.config().max_steps));
-        const float eff_query_prob = eff_enable_query
-            ? std::clamp(cfg_.force_query_prob, 0.0f, 1.0f)
-            : 0.0f;
-        std::uniform_int_distribution<size_t> loop_dist(loop_min, loop_max);
-        std::bernoulli_distribution force_query_dist(eff_query_prob);
+        ActionRenormController renorm(cfg_, model.config().max_steps);
 
         float loss = 0.0f;
         arch::Vector prev_step_raw_logits; // Phase 4: multi-step consistency
         for (size_t ti = 0; ti < used_steps; ++ti) {
             const size_t t = (start + ti) % steps;
-            const size_t forced_loops = loop_dist(rng);
-            const bool force_query_first = eff_enable_query && force_query_dist(rng);
             const bool write_memory = memory_epoch_active
                 && (!cfg_.disable_memory_writes_when_query_disabled || eff_enable_query);
+            const arch::ActionControl action_control = renorm.control();
             const auto trace = model.step_with_trace(
                 ex.input[t],
                 recurrent_state,
-                kv_cache,
+                chrono_kv_cache,
+                krv_cache,
                 bridge,
                 query,
                 cfg_.force_output,
                 eff_enable_query,
-                forced_loops,
+                0,
                 cfg_.use_parallel_retention,
                 write_memory,
-                force_query_first);
+                false,
+                &action_control);
+            renorm.update(trace);
 
             loss += output_loss_from_logits(trace.logits, static_cast<size_t>(static_cast<uint8_t>(ex.target[t])));
             if (!std::isfinite(loss)) {
@@ -826,15 +902,15 @@ class LoopingRetNetSGDTrainer {
                 }
             }
 
-            if (eff_enable_query && !kv_cache.keys.empty()) {
-                const arch::AttentionMemory queried = query.query(kv_cache.keys.back());
+            if (eff_enable_query && !krv_cache.keys.empty()) {
+                const arch::AttentionMemory queried = query.query(krv_cache.keys.back());
                 if (queried.empty()) {
-                    const float miss_scale = 1.0f + 0.1f * std::min<float>(10.0f, static_cast<float>(kv_cache.keys.size()));
+                    const float miss_scale = 1.0f + 0.1f * std::min<float>(10.0f, static_cast<float>(krv_cache.keys.size()));
                     loss += cfg_.memory_miss_penalty * miss_scale;
                 } else {
                     // Robust memory signal: queried values should align with
                     // the latest value in cache.
-                    const arch::Vector& target_value = kv_cache.values.back();
+                    const arch::Vector& target_value = krv_cache.values.back();
                     float best_sim = -1.0f;
                     for (const auto& qv : queried.values) {
                         best_sim = std::max(best_sim, cosine_similarity(qv, target_value));
@@ -845,7 +921,7 @@ class LoopingRetNetSGDTrainer {
 
             // Prevent unchecked KV-cache growth from dominating compute.
             const float allowed_edges = static_cast<float>(cfg_.memory_cfg.max_write_entries * (ti + 1));
-            const float actual_edges = static_cast<float>(kv_cache.keys.size());
+            const float actual_edges = static_cast<float>(krv_cache.keys.size());
             if (actual_edges > allowed_edges && allowed_edges > 0.0f) {
                 const float over_ratio = (actual_edges - allowed_edges) / allowed_edges;
                 loss += cfg_.memory_edge_budget_penalty * over_ratio;
@@ -989,6 +1065,169 @@ public:
                     break;
             }
         };
+
+        auto run_sentence_krv_alignment_epoch = [&](size_t epoch_1_based, float lr_epoch) -> std::pair<float, size_t> {
+            (void)lr_epoch;
+            if (cfg_.sentence_krv_examples.empty() || cfg_.sentence_krv_loss_weight <= 0.0f) {
+                return {0.0f, 0};
+            }
+
+            auto& mem_w = model.memory_entry_weights();
+            auto& mem_b = model.memory_entry_bias();
+            const size_t mem_in = model.memory_entry_input_dim();
+            const size_t mem_out = model.memory_entry_output_dim();
+            const size_t k_dim = model.config().qk_dim;
+            const size_t r_dim = model.config().rel_dim;
+            const size_t v_dim = model.config().v_dim;
+
+            if (mem_out != k_dim + r_dim + v_dim) {
+                return {0.0f, 0};
+            }
+
+            ParameterTensor p_mem_w;
+            p_mem_w.values = mem_w;
+            p_mem_w.grads.assign(mem_w.size(), static_cast<Scalar>(0.0f));
+
+            ParameterTensor p_mem_b;
+            p_mem_b.values = mem_b;
+            p_mem_b.grads.assign(mem_b.size(), static_cast<Scalar>(0.0f));
+
+            float loss_acc = 0.0f;
+            size_t used = 0;
+
+            for (const auto& ex : cfg_.sentence_krv_examples) {
+                if (ex.sentence.empty()) {
+                    continue;
+                }
+
+                Graph graph;
+                SpatialMap spatial_map;
+                memory::NodeCompressor compressor(model.config().v_dim, cfg_.memory_cfg.semvec_dim, cfg_.seed ^ static_cast<uint32_t>(epoch_1_based));
+                memory::GraphMemoryBridge bridge(graph, spatial_map, std::move(compressor), cfg_.memory_cfg);
+                memory::MultiHopQuery query(graph, spatial_map, cfg_.memory_cfg);
+
+                arch::KVState recurrent_state;
+                arch::AttentionMemory chrono_kv_cache;
+                arch::AttentionMemory krv_cache;
+
+                arch::LoopingRetNet::StepTrace last_trace{};
+                bool got_generated = false;
+                for (char c : ex.sentence) {
+                    arch::ActionControl ctrl;
+                    ctrl.enabled = true;
+                    ctrl.force_create_memory_first = true;
+                    ctrl.output_bias = -2.0f;
+                    ctrl.loop_bias = -1.0f;
+                    ctrl.query_bias = -1.0f;
+                    ctrl.create_bias = 3.0f;
+
+                    last_trace = model.step_with_trace(
+                        c,
+                        recurrent_state,
+                        chrono_kv_cache,
+                        krv_cache,
+                        bridge,
+                        query,
+                        false,
+                        false,
+                        0,
+                        cfg_.use_parallel_retention,
+                        true,
+                        false,
+                        &ctrl);
+                    if (last_trace.has_generated_memory) {
+                        got_generated = true;
+                        break;
+                    }
+                }
+
+                if (!got_generated
+                    || last_trace.generated_memory_state.size() != mem_in
+                    || last_trace.generated_key.size() != k_dim
+                    || last_trace.generated_relation.size() != r_dim
+                    || last_trace.generated_value.size() != v_dim) {
+                    continue;
+                }
+
+                std::vector<float> target(mem_out, 0.0f);
+                for (size_t i = 0; i < k_dim && i < ex.key_embedding.size(); ++i) {
+                    target[i] = ex.key_embedding[i];
+                }
+                for (size_t i = 0; i < r_dim && i < ex.relation_embedding.size(); ++i) {
+                    target[k_dim + i] = ex.relation_embedding[i];
+                }
+                for (size_t i = 0; i < v_dim && i < ex.value_embedding.size(); ++i) {
+                    target[k_dim + r_dim + i] = ex.value_embedding[i];
+                }
+
+                std::vector<float> pred(mem_out, 0.0f);
+                for (size_t i = 0; i < k_dim; ++i) {
+                    pred[i] = static_cast<float>(last_trace.generated_key[i]);
+                }
+                for (size_t i = 0; i < r_dim; ++i) {
+                    pred[k_dim + i] = static_cast<float>(last_trace.generated_relation[i]);
+                }
+                for (size_t i = 0; i < v_dim; ++i) {
+                    pred[k_dim + r_dim + i] = static_cast<float>(last_trace.generated_value[i]);
+                }
+
+                for (size_t o = 0; o < mem_out; ++o) {
+                    const float diff = pred[o] - target[o];
+                    loss_acc += 0.5f * diff * diff;
+                    const float d = cfg_.sentence_krv_loss_weight * diff;
+                    p_mem_b.grads[o] = static_cast<Scalar>(
+                        static_cast<float>(p_mem_b.grads[o]) + d);
+                    for (size_t i = 0; i < mem_in; ++i) {
+                        const size_t wi = o * mem_in + i;
+                        p_mem_w.grads[wi] = static_cast<Scalar>(
+                            static_cast<float>(p_mem_w.grads[wi])
+                            + d * static_cast<float>(last_trace.generated_memory_state[i]));
+                    }
+                }
+                ++used;
+            }
+
+            if (used == 0) {
+                return {0.0f, 0};
+            }
+
+            const float inv = 1.0f / static_cast<float>(used);
+            for (auto& g : p_mem_w.grads) {
+                g = static_cast<Scalar>(static_cast<float>(g) * inv);
+            }
+            for (auto& g : p_mem_b.grads) {
+                g = static_cast<Scalar>(static_cast<float>(g) * inv);
+            }
+
+            clip_gradients_abs(p_mem_w.grads, cfg_.max_gradient_abs);
+            clip_gradients_abs(p_mem_b.grads, cfg_.max_gradient_abs);
+
+            std::vector<ParameterTensor> params;
+            params.push_back(p_mem_w);
+            params.push_back(p_mem_b);
+            optimizer_step(params);
+
+            p_mem_w = params[0];
+            p_mem_b = params[1];
+
+            for (auto& v : p_mem_w.values) {
+                const float vf = static_cast<float>(v);
+                if (std::isfinite(vf)) {
+                    v = static_cast<Scalar>(std::clamp(vf, -cfg_.max_parameter_abs, cfg_.max_parameter_abs));
+                }
+            }
+            for (auto& v : p_mem_b.values) {
+                const float vf = static_cast<float>(v);
+                if (std::isfinite(vf)) {
+                    v = static_cast<Scalar>(std::clamp(vf, -cfg_.max_parameter_abs, cfg_.max_parameter_abs));
+                }
+            }
+
+            mem_w = p_mem_w.values;
+            mem_b = p_mem_b.values;
+            return {loss_acc * inv, used};
+        };
+
         float lr_multiplier = 1.0f;
         size_t lr_cooldown_left = 0;
         float prev_epoch_loss = 0.0f;
@@ -1317,8 +1556,6 @@ public:
                                 std::mt19937 ex_rng(per_example_seed(cfg_.seed, epoch + 1, batch_start, exi));
                                 std::uniform_int_distribution<size_t> start_dist(0, steps - 1);
                                 const size_t start = start_dist(ex_rng);
-                                std::bernoulli_distribution force_query_dist(
-                                    std::clamp(cfg_.force_query_prob, 0.0f, 1.0f));
 
                                 Graph graph;
                                 SpatialMap spatial_map;
@@ -1327,7 +1564,9 @@ public:
                                 memory::MultiHopQuery query(graph, spatial_map, cfg_.memory_cfg);
 
                                 arch::KVState recurrent_state;
-                                arch::AttentionMemory kv_cache;
+                                arch::AttentionMemory chrono_kv_cache;
+                                arch::AttentionMemory krv_cache;
+                                ActionRenormController renorm(cfg_, model.config().max_steps);
 
                                 arch::Vector bp_prev_raw_logits; // Phase 4: multi-step consistency
                                 for (size_t ti = 0; ti < steps; ++ti) {
@@ -1338,25 +1577,25 @@ public:
                                         ? false
                                         : (cfg_.enable_query && bp_memory_active);
                                     const bool force_output = cfg_.backprop_force_single_step ? true : cfg_.force_output;
-                                    const size_t forced_loops = cfg_.backprop_force_single_step
-                                        ? 1
-                                        : std::max<size_t>(1, cfg_.forced_loop_min);
                                     const bool write_memory = !cfg_.disable_memory_writes_when_query_disabled || use_query;
-                                    const bool force_query_first = use_query && force_query_dist(ex_rng);
+                                    const arch::ActionControl action_control = renorm.control();
 
                                     const auto trace_t0 = std::chrono::steady_clock::now();
                                     const auto trace = model.step_with_trace(
                                         ex.input[t],
                                         recurrent_state,
-                                        kv_cache,
+                                        chrono_kv_cache,
+                                        krv_cache,
                                         bridge,
                                         query,
                                         force_output,
                                         use_query,
-                                        forced_loops,
+                                        cfg_.backprop_force_single_step ? 1 : 0,
                                         false,
                                         write_memory,
-                                        force_query_first);
+                                        false,
+                                        &action_control);
+                                    renorm.update(trace);
                                     const auto trace_t1 = std::chrono::steady_clock::now();
                                     local_seq_forward_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(trace_t1 - trace_t0).count();
                                     local_query_events += trace.query_count;
@@ -2362,6 +2601,16 @@ public:
                     epoch_loss = kNonFinitePenalty;
                 } else {
                     epoch_loss = epoch_loss_acc / static_cast<float>(epoch_token_count);
+                }
+            }
+
+            const auto [sentence_krv_loss, sentence_krv_used] =
+                run_sentence_krv_alignment_epoch(epoch + 1, lr_epoch);
+            if (sentence_krv_used > 0 && std::isfinite(sentence_krv_loss)) {
+                if (std::isfinite(epoch_loss)) {
+                    epoch_loss += sentence_krv_loss;
+                } else {
+                    epoch_loss = sentence_krv_loss;
                 }
             }
 
