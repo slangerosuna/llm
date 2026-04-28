@@ -130,8 +130,8 @@ class Adam {
 	float eps_;
 	float weight_decay_;
 	size_t t_;
-	std::vector<std::vector<Scalar>> m_;
-	std::vector<std::vector<Scalar>> v_;
+	std::vector<std::vector<float>> m_;
+	std::vector<std::vector<float>> v_;
 
 public:
 	explicit Adam(
@@ -169,22 +169,22 @@ public:
 				}
 
 				if (m_[pidx].size() != p.values.size()) {
-					m_[pidx].assign(p.values.size(), static_cast<Scalar>(0.0f));
-					v_[pidx].assign(p.values.size(), static_cast<Scalar>(0.0f));
+					m_[pidx].assign(p.values.size(), 0.0f);
+					v_[pidx].assign(p.values.size(), 0.0f);
 				}
 
 				for (size_t i = 0; i < p.values.size(); ++i) {
 					const float pv = static_cast<float>(p.values[i]);
 					const float grad = static_cast<float>(p.grads[i]) + weight_decay_ * pv;
-					const float m = beta1_ * static_cast<float>(m_[pidx][i]) + (1.0f - beta1_) * grad;
-					const float v = beta2_ * static_cast<float>(v_[pidx][i]) + (1.0f - beta2_) * grad * grad;
+					const float m = beta1_ * m_[pidx][i] + (1.0f - beta1_) * grad;
+					const float v = beta2_ * v_[pidx][i] + (1.0f - beta2_) * grad * grad;
 
 					const float m_hat = m / b1_corr;
 					const float v_hat = v / b2_corr;
 					const float updated = pv - lr_ * m_hat / (std::sqrt(v_hat) + eps_);
 
-					m_[pidx][i] = static_cast<Scalar>(m);
-					v_[pidx][i] = static_cast<Scalar>(v);
+					m_[pidx][i] = m;
+					v_[pidx][i] = v;
 					p.values[i] = static_cast<Scalar>(updated);
 				}
 			}
@@ -205,14 +205,14 @@ public:
 			}
 
 			if (m_[pidx].size() != p.values.size()) {
-				m_[pidx].assign(p.values.size(), static_cast<Scalar>(0.0f));
-				v_[pidx].assign(p.values.size(), static_cast<Scalar>(0.0f));
+				m_[pidx].assign(p.values.size(), 0.0f);
+				v_[pidx].assign(p.values.size(), 0.0f);
 			}
 
 			sycl::buffer<Scalar> val_buf(p.values.data(), sycl::range<1>(p.values.size()));
 			sycl::buffer<Scalar> grad_buf(p.grads.data(), sycl::range<1>(p.grads.size()));
-			sycl::buffer<Scalar> m_buf(m_[pidx].data(), sycl::range<1>(m_[pidx].size()));
-			sycl::buffer<Scalar> v_buf(v_[pidx].data(), sycl::range<1>(v_[pidx].size()));
+			sycl::buffer<float> m_buf(m_[pidx].data(), sycl::range<1>(m_[pidx].size()));
+			sycl::buffer<float> v_buf(v_[pidx].data(), sycl::range<1>(v_[pidx].size()));
 
 			q.submit([&](sycl::handler& h) {
 				auto val_acc = val_buf.get_access<sycl::access::mode::read_write>(h);
@@ -223,15 +223,15 @@ public:
 				h.parallel_for(sycl::range<1>(p.values.size()), [=](sycl::id<1> i) {
 					const float pv = static_cast<float>(val_acc[i]);
 					const float grad = static_cast<float>(grad_acc[i]) + wd * pv;
-					const float m = b1 * static_cast<float>(m_acc[i]) + (1.0f - b1) * grad;
-					const float v = b2 * static_cast<float>(v_acc[i]) + (1.0f - b2) * grad * grad;
+					const float m = b1 * m_acc[i] + (1.0f - b1) * grad;
+					const float v = b2 * v_acc[i] + (1.0f - b2) * grad * grad;
 
 					const float m_hat = m / b1_corr;
 					const float v_hat = v / b2_corr;
 					const float updated = pv - lr * m_hat / (sycl::sqrt(v_hat) + eps);
 
-					m_acc[i] = static_cast<Scalar>(m);
-					v_acc[i] = static_cast<Scalar>(v);
+					m_acc[i] = m;
+					v_acc[i] = v;
 					val_acc[i] = static_cast<Scalar>(updated);
 				});
 			});

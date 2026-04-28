@@ -44,10 +44,10 @@ enum class OutputLossType : uint8_t {
 struct TrainConfig {
     TrainMode mode = TrainMode::BackpropFull;
     size_t epochs = 256;
-    float learning_rate = 1.0e-2f;      // peak LR after warmup
-    float min_learning_rate = 1e-4f;  // absolute LR floor
+    float learning_rate = 3.0e-4f;      // peak LR after warmup (Adam-safe default)
+    float min_learning_rate = 1e-6f;  // absolute LR floor
     float min_learning_rate_ratio = 0.1f; // relative floor vs peak LR
-    size_t warmup_epochs = 8;         // linear warmup epochs
+    size_t warmup_epochs = 32;         // linear warmup epochs
     float warmup_start_ratio = 0.1f;  // warmup starts at peak_lr * ratio
     float loss_ema_beta = 0.9f;       // moving-average smoothing for logging
     float weight_decay = 1e-4f;
