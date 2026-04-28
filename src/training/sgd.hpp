@@ -241,6 +241,64 @@ public:
 	}
 };
 
+class Muon {
+	float lr_;
+	float momentum_;
+	float eps_;
+	float weight_decay_;
+	std::vector<std::vector<float>> velocity_;
+
+public:
+	explicit Muon(
+		float learning_rate = 1e-3f,
+		float momentum = 0.95f,
+		float eps = 1e-8f,
+		float weight_decay = 0.0f)
+	  : lr_(learning_rate),
+		momentum_(momentum),
+		eps_(eps),
+		weight_decay_(weight_decay) {}
+
+	void set_learning_rate(float learning_rate) { lr_ = learning_rate; }
+
+	float learning_rate() const { return lr_; }
+
+	void step(std::vector<ParameterTensor>& params) {
+		if (velocity_.size() != params.size()) {
+			velocity_.assign(params.size(), {});
+		}
+
+		for (size_t pidx = 0; pidx < params.size(); ++pidx) {
+			auto& p = params[pidx];
+			if (p.values.size() != p.grads.size()) {
+				throw std::runtime_error("Muon parameter/gradient shape mismatch");
+			}
+			if (velocity_[pidx].size() != p.values.size()) {
+				velocity_[pidx].assign(p.values.size(), 0.0f);
+			}
+
+			float sq_sum = 0.0f;
+			for (size_t i = 0; i < p.values.size(); ++i) {
+				const float pv = static_cast<float>(p.values[i]);
+				const float g = static_cast<float>(p.grads[i]);
+				const float v = momentum_ * velocity_[pidx][i] + (1.0f - momentum_) * g;
+				velocity_[pidx][i] = v;
+				sq_sum += v * v;
+			}
+
+			const float denom = std::sqrt(sq_sum / std::max<size_t>(size_t{1}, p.values.size())) + eps_;
+			for (size_t i = 0; i < p.values.size(); ++i) {
+				float pv = static_cast<float>(p.values[i]);
+				if (weight_decay_ > 0.0f) {
+					pv *= (1.0f - lr_ * weight_decay_);
+				}
+				pv -= lr_ * (velocity_[pidx][i] / denom);
+				p.values[i] = static_cast<Scalar>(pv);
+			}
+		}
+	}
+};
+
 class AdamW {
 	float lr_;
 	float beta1_;

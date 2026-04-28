@@ -41,8 +41,15 @@ enum class OutputLossType : uint8_t {
     FocalLoss = 2,            // (1-p_t)^gamma * -log(p_t), optionally with class weights
 };
 
+enum class TrainOptimizer : uint8_t {
+    Adam = 0,
+    Muon = 1,
+    SGD = 2,
+};
+
 struct TrainConfig {
     TrainMode mode = TrainMode::BackpropFull;
+    TrainOptimizer optimizer = TrainOptimizer::Adam;
     size_t epochs = 256;
     float learning_rate = 3.0e-4f;      // peak LR after warmup (Adam-safe default)
     float min_learning_rate = 1e-6f;  // absolute LR floor
@@ -52,6 +59,8 @@ struct TrainConfig {
     float loss_ema_beta = 0.9f;       // moving-average smoothing for logging
     float weight_decay = 1e-4f;
     float sgd_momentum = 0.9f;
+    float muon_momentum = 0.95f;
+    float muon_eps = 1e-8f;
     float max_gradient_abs = 5.0f;    // per-coordinate grad clip
     float max_parameter_abs = 100.0f; // post-step parameter clamp
     bool enable_instability_backoff = true;
@@ -947,7 +956,39 @@ public:
 
         std::mt19937 rng(cfg_.seed);
         rebuild_sampled_target_pt(dataset, model.output_dim(), rng);
-        Adam optimizer(learning_rate_for_epoch(1), 0.9f, 0.999f, 1e-8f, cfg_.weight_decay);
+        Adam adam_optimizer(learning_rate_for_epoch(1), 0.9f, 0.999f, 1e-8f, cfg_.weight_decay);
+        Muon muon_optimizer(learning_rate_for_epoch(1), cfg_.muon_momentum, cfg_.muon_eps, cfg_.weight_decay);
+        SGD sgd_optimizer(learning_rate_for_epoch(1), cfg_.weight_decay, cfg_.sgd_momentum);
+
+        auto set_optimizer_learning_rate = [&](float lr) {
+            switch (cfg_.optimizer) {
+                case TrainOptimizer::Muon:
+                    muon_optimizer.set_learning_rate(lr);
+                    break;
+                case TrainOptimizer::SGD:
+                    sgd_optimizer.set_learning_rate(lr);
+                    break;
+                case TrainOptimizer::Adam:
+                default:
+                    adam_optimizer.set_learning_rate(lr);
+                    break;
+            }
+        };
+
+        auto optimizer_step = [&](std::vector<ParameterTensor>& params) {
+            switch (cfg_.optimizer) {
+                case TrainOptimizer::Muon:
+                    muon_optimizer.step(params);
+                    break;
+                case TrainOptimizer::SGD:
+                    sgd_optimizer.step(params);
+                    break;
+                case TrainOptimizer::Adam:
+                default:
+                    adam_optimizer.step(params);
+                    break;
+            }
+        };
         float lr_multiplier = 1.0f;
         size_t lr_cooldown_left = 0;
         float prev_epoch_loss = 0.0f;
@@ -977,7 +1018,7 @@ public:
             const float lr_epoch = std::max(
                 cfg_.min_effective_learning_rate,
                 base_lr_epoch * std::max(0.0f, lr_multiplier));
-            optimizer.set_learning_rate(lr_epoch);
+            set_optimizer_learning_rate(lr_epoch);
             double fd_ms = 0.0;
             size_t grad_samples_epoch = 0;
             float active_grad_fraction = 0.0f;
@@ -1144,7 +1185,7 @@ public:
                     : static_cast<float>(active_grad_coords) / static_cast<float>(grad_hits.size());
 
                 std::vector<ParameterTensor> params{tensor};
-                optimizer.step(params);
+                optimizer_step(params);
 
                 for (size_t i = 0; i < refs.size(); ++i) {
                     const float updated = static_cast<float>(params[0].values[i]);
@@ -1557,7 +1598,7 @@ public:
 
                     params.push_back(p_load_w);
                     params.push_back(p_load_b);
-                    optimizer.step(params);
+                    optimizer_step(params);
 
                     p_out_w = params[0];
                     p_out_b = params[1];
@@ -2253,7 +2294,7 @@ public:
                     params.push_back(p_load_w); params.push_back(p_load_b);
                     params.push_back(p_theta);
 
-                    optimizer.step(params);
+                    optimizer_step(params);
 
                     size_t pi = 0;
                     p_embed = params[pi++];

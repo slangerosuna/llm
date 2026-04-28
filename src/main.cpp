@@ -268,6 +268,7 @@ using llm::arch::LoopingRetNet;
 using llm::training::looping::LoopingRetNetSGDTrainer;
 using llm::training::looping::TrainConfig;
 using llm::training::looping::TrainMode;
+using llm::training::looping::TrainOptimizer;
 
 struct ParsedArgs {
   std::vector<std::string> positionals;
@@ -341,6 +342,20 @@ TrainMode parse_train_mode(const std::string& raw) {
     return TrainMode::BackpropFull;
   }
   throw std::runtime_error("Unsupported train mode: " + raw);
+}
+
+TrainOptimizer parse_train_optimizer(const std::string& raw) {
+  const std::string opt = to_lower(raw);
+  if (opt == "adam") {
+    return TrainOptimizer::Adam;
+  }
+  if (opt == "muon") {
+    return TrainOptimizer::Muon;
+  }
+  if (opt == "sgd") {
+    return TrainOptimizer::SGD;
+  }
+  throw std::runtime_error("Unsupported optimizer: " + raw);
 }
 
 ParsedArgs parse_args(int argc, char** argv, int start_index) {
@@ -532,6 +547,7 @@ void print_usage(const char* program) {
       << "Train common optional flags:\n"
       << "  -i, --input PATH              Existing model binary to continue training\n"
       << "  --mode MODE                   FiniteDifference|BackpropHeads|BackpropFull\n"
+      << "  --optimizer OPT              Adam|Muon|SGD\n"
       << "  --epochs N                    Training epochs\n"
       << "  --learning-rate F             Learning rate\n"
       << "  --batch-size N                Batch size\n"
@@ -539,6 +555,8 @@ void print_usage(const char* program) {
       << "  --min-parallel-batch N        Min batch examples before threading\n"
       << "  --weight-decay F              Weight decay\n"
       << "  --sgd-momentum F              SGD momentum\n"
+      << "  --muon-momentum F             Muon momentum\n"
+      << "  --muon-eps F                  Muon epsilon\n"
       << "  --samples-per-epoch N         Random samples per epoch (0 = use all)\n"
       << "  --force-query-prob F          Probability of forcing first inner step to QUERY_MEMORY\n"
       << "  --load-gate-supervision-weight F Weight for memory-load gate supervision\n"
@@ -612,6 +630,9 @@ int run_train_command(const ParsedArgs& args) {
   if (has_flag(args, "mode")) {
     train_cfg.mode = parse_train_mode(get_flag(args, "mode"));
   }
+  if (has_flag(args, "optimizer")) {
+    train_cfg.optimizer = parse_train_optimizer(get_flag(args, "optimizer"));
+  }
   if (has_flag(args, "epochs")) {
     train_cfg.epochs = parse_size(get_flag(args, "epochs"), "epochs");
   }
@@ -638,6 +659,12 @@ int run_train_command(const ParsedArgs& args) {
   }
   if (has_flag(args, "sgd-momentum")) {
     train_cfg.sgd_momentum = parse_float(get_flag(args, "sgd-momentum"), "sgd-momentum");
+  }
+  if (has_flag(args, "muon-momentum")) {
+    train_cfg.muon_momentum = parse_float(get_flag(args, "muon-momentum"), "muon-momentum");
+  }
+  if (has_flag(args, "muon-eps")) {
+    train_cfg.muon_eps = parse_float(get_flag(args, "muon-eps"), "muon-eps");
   }
   if (has_flag(args, "fd-eps")) {
     train_cfg.fd_eps = parse_float(get_flag(args, "fd-eps"), "fd-eps");
