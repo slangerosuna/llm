@@ -2822,7 +2822,7 @@ public:
                         ? epoch_loss_acc / static_cast<float>(epoch_token_count)
                         : 0.0f,
                         std::min(batch_start + cfg_.batch_size, epoch_dataset.size()),
-                        epoch_dataset.size());
+                        epoch_dataset.size() / cfg_.batch_size);
 
                     if (cfg_.alternate_text_and_krv_batches) {
                         const auto [krv_batch_loss, krv_used] =
