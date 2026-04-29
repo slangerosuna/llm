@@ -1,4 +1,5 @@
 import csv
+import math
 import multiprocessing as mp
 from argparse import ArgumentParser
 
@@ -64,6 +65,43 @@ def _init_worker(devices):
     worker_index = (identity[0] - 1) if identity else 0
     device = _resolve_worker_device(worker_index, devices)
     _init_models(device)
+
+
+def _process_sentence_with_models(sentence):
+    triple = generate_krv_sentences(sentence)
+    if triple is None:
+        return None
+
+    subject, object_, relation = triple
+
+    k_emb = _encode_embedding(subject, k_embed_dim)
+    r_emb = _encode_embedding(relation, r_embed_dim)
+    v_emb = _encode_embedding(object_, v_embed_dim)
+
+    return (
+        sentence,
+        subject,
+        relation,
+        object_,
+        k_emb.tobytes() + r_emb.tobytes() + v_emb.tobytes(),
+    )
+
+
+def _gpu_server_main(device, request_queue, response_queue):
+    _init_models(device)
+    while True:
+        item = request_queue.get()
+        if item is None:
+            break
+
+        idx, sentence = item
+        payload = None
+        try:
+            payload = _process_sentence_with_models(sentence)
+        except Exception as exc:
+            print(f"Worker on {device} failed for index {idx}: {exc}")
+
+        response_queue.put((idx, payload))
 
 
 def generate_krv_sentences(sentence):
@@ -166,17 +204,7 @@ def _encode_embedding(text, dim):
 
 def _process_sentence(task):
     idx, sentence = task
-    triple = generate_krv_sentences(sentence)
-    if triple is None:
-        return idx, None
-
-    subject, object_, relation = triple
-
-    k_emb = _encode_embedding(subject, k_embed_dim)
-    r_emb = _encode_embedding(relation, r_embed_dim)
-    v_emb = _encode_embedding(object_, v_embed_dim)
-
-    return idx, (sentence, subject, relation, object_, k_emb.tobytes() + r_emb.tobytes() + v_emb.tobytes())
+    return idx, _process_sentence_with_models(sentence)
 
 
 def generate_krv_database(sentences, workers=1, devices=None):
@@ -206,8 +234,16 @@ def generate_krv_database(sentences, workers=1, devices=None):
         tasks = list(enumerate(sentences))
         written = 0
 
-        if workers <= 1:
-            _init_models(_resolve_worker_device(0, devices or []))
+        worker_devices = _unique_devices(devices or [])
+        if not worker_devices:
+            if torch.cuda.is_available():
+                worker_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+            else:
+                worker_devices = ["cpu"]
+
+        # CPU-only path: keep simple local processing unless explicitly parallelized.
+        if (not torch.cuda.is_available()) or workers <= 1:
+            _init_models(worker_devices[0])
             for i, task in enumerate(tasks, start=1):
                 print(f"Processing record {i}/{total_records}...")
                 _, payload = _process_sentence(task)
@@ -220,34 +256,52 @@ def generate_krv_database(sentences, workers=1, devices=None):
             print(f"Wrote {written}/{total_records} records")
             return
 
+        # GPU path: exactly one model server process per GPU device.
+        # "workers" controls logical per-GPU request lanes, not model replicas.
+        workers = max(1, workers)
+        worker_devices = [d for d in worker_devices if d.startswith("cuda")]
+        if not worker_devices:
+            worker_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+
+        num_devices = len(worker_devices)
+        workers_per_gpu = max(1, math.ceil(workers / num_devices))
+        max_in_flight = max(1, workers_per_gpu * num_devices * 2)
+
+        print(
+            f"Starting {num_devices} model server(s) with {workers_per_gpu} worker lane(s) per GPU "
+            "sharing one model instance per device."
+        )
+
         pending = {}
         next_idx = 0
         processed = 0
-
-        worker_devices = _unique_devices(devices or [])
-        if not worker_devices:
-            if torch.cuda.is_available():
-                worker_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
-            else:
-                worker_devices = ["cpu"]
-
-        effective_workers = min(max(1, workers), len(worker_devices))
-        worker_devices = worker_devices[:effective_workers]
-
-        if effective_workers < workers:
-            print(
-                "Capping workers from "
-                f"{workers} to {effective_workers} to ensure models are loaded once per device."
-            )
+        submitted = 0
+        in_flight = 0
 
         ctx = mp.get_context("spawn")
-        with ctx.Pool(
-            processes=effective_workers,
-            initializer=_init_worker,
-            initargs=(worker_devices,),
-        ) as pool:
-            for idx, payload in pool.imap_unordered(_process_sentence, tasks, chunksize=1):
+        response_queue = ctx.Queue()
+        request_queues = []
+        servers = []
+
+        try:
+            for device in worker_devices:
+                rq = ctx.Queue(maxsize=max(2, workers_per_gpu * 2))
+                p = ctx.Process(target=_gpu_server_main, args=(device, rq, response_queue), daemon=True)
+                p.start()
+                request_queues.append(rq)
+                servers.append(p)
+
+            while processed < total_records:
+                while submitted < total_records and in_flight < max_in_flight:
+                    idx, sentence = tasks[submitted]
+                    device_slot = idx % num_devices
+                    request_queues[device_slot].put((idx, sentence))
+                    submitted += 1
+                    in_flight += 1
+
+                idx, payload = response_queue.get()
                 processed += 1
+                in_flight -= 1
                 print(f"Processed record {processed}/{total_records}...")
                 pending[idx] = payload
 
@@ -259,6 +313,11 @@ def generate_krv_database(sentences, workers=1, devices=None):
                         krv_db_file.write(payload_bytes)
                         written += 1
                     next_idx += 1
+        finally:
+            for rq in request_queues:
+                rq.put(None)
+            for p in servers:
+                p.join()
 
         print(f"Wrote {written}/{total_records} records")
 
@@ -284,13 +343,13 @@ if __name__ == "__main__":
         "--workers",
         type=int,
         default=0,
-        help="Parallel worker processes (0 = auto from --workers-per-gpu)",
+        help="Total logical worker lanes across GPUs (0 = auto from --workers-per-gpu)",
     )
     parser.add_argument(
         "--workers-per-gpu",
         type=int,
         default=1,
-        help="When CUDA is available and --workers=0, target this many workers per GPU (capped to one load per device)",
+        help="When CUDA is available and --workers=0, logical worker lanes per GPU (one model load per device)",
     )
     parser.add_argument("--max-lines", type=int, default=max_lines_to_extract, help="Max number of source lines")
     parser.add_argument(
