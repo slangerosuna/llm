@@ -1,18 +1,19 @@
 import csv
+import multiprocessing as mp
+import os
+from argparse import ArgumentParser
 
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer
-
-embedding_model = SentenceTransformer("Qwen/Qwen3-Embedding-4B")
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model_name = "Qwen/Qwen3-4B-Instruct-2507"
 
-sentence_gen_model = AutoModelForCausalLM.from_pretrained(
-    model_name, torch_dtype="auto", device_map="auto"
-)
-sentence_gen_tokenizer = AutoTokenizer.from_pretrained(model_name)
+embedding_model = None
+sentence_gen_model = None
+sentence_gen_tokenizer = None
 
 k_embed_dim = 256
 r_embed_dim = 128
@@ -20,10 +21,40 @@ v_embed_dim = 256
 
 s_database_path = "datasets/facts.json"
 
-output_krv_database_path = "krv-database.bin"
-output_s_database_path = "s-database.csv"
+output_krv_database_path = "datasets/krv-database.bin"
+output_s_database_path = "datasets/s-database.csv"
 
 max_lines_to_extract = 16384
+
+
+def _resolve_worker_device(worker_index, devices):
+    if devices:
+        return devices[worker_index % len(devices)]
+    if torch.cuda.is_available():
+        return f"cuda:{worker_index % max(1, torch.cuda.device_count())}"
+    return "cpu"
+
+
+def _init_models(device):
+    global embedding_model
+    global sentence_gen_model
+    global sentence_gen_tokenizer
+
+    if embedding_model is not None and sentence_gen_model is not None and sentence_gen_tokenizer is not None:
+        return
+
+    embedding_model = SentenceTransformer("Qwen/Qwen3-Embedding-4B", device=device)
+    sentence_gen_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto")
+    sentence_gen_model.to(device)
+    sentence_gen_model.eval()
+    sentence_gen_tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+
+def _init_worker(devices):
+    identity = mp.current_process()._identity
+    worker_index = (identity[0] - 1) if identity else 0
+    device = _resolve_worker_device(worker_index, devices)
+    _init_models(device)
 
 
 def generate_krv_sentences(sentence):
@@ -61,9 +92,7 @@ Sentence: "{sentence}"
     text = sentence_gen_tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    model_inputs = sentence_gen_tokenizer([text], return_tensors="pt").to(
-        sentence_gen_model.device
-    )
+    model_inputs = sentence_gen_tokenizer([text], return_tensors="pt").to(sentence_gen_model.device)
 
     generated_ids = sentence_gen_model.generate(**model_inputs, max_new_tokens=512)
     generated_ids = [
@@ -117,7 +146,31 @@ def load_sentences(file_path, num_sentences):
     return sentences
 
 
-def generate_krv_database(sentences):
+def _encode_embedding(text, dim):
+    emb = embedding_model.encode(text, truncate_dim=dim, convert_to_numpy=True)
+    emb = np.asarray(emb, dtype=np.float32).reshape(-1)
+    out = np.zeros((dim,), dtype="<f2")
+    take = min(dim, emb.shape[0])
+    out[:take] = emb[:take].astype("<f2")
+    return out
+
+
+def _process_sentence(task):
+    idx, sentence = task
+    triple = generate_krv_sentences(sentence)
+    if triple is None:
+        return idx, None
+
+    subject, object_, relation = triple
+
+    k_emb = _encode_embedding(subject, k_embed_dim)
+    r_emb = _encode_embedding(relation, r_embed_dim)
+    v_emb = _encode_embedding(object_, v_embed_dim)
+
+    return idx, (sentence, subject, relation, object_, k_emb.tobytes() + r_emb.tobytes() + v_emb.tobytes())
+
+
+def generate_krv_database(sentences, workers=1, devices=None):
     with (
         open(output_s_database_path, "w", encoding="utf-8", newline="") as s_db_file,
         open(output_krv_database_path, "wb") as krv_db_file,
@@ -138,62 +191,82 @@ def generate_krv_database(sentences):
         krv_db_file.write((0).to_bytes(2, byteorder="little"))
 
         total_records = len(sentences)
-        current_record = 0
+        if total_records == 0:
+            return
 
-        for sentence in sentences:
-            current_record += 1
-            if current_record % 100 == 0:
-                print(f"Processing record {current_record}/{total_records}...")
+        tasks = list(enumerate(sentences))
+        written = 0
 
-            triple = generate_krv_sentences(sentence)
-            if triple is None:
-                continue
+        if workers <= 1:
+            _init_models(_resolve_worker_device(0, devices or []))
+            for i, task in enumerate(tasks, start=1):
+                print(f"Processing record {i}/{total_records}...")
+                _, payload = _process_sentence(task)
+                if payload is None:
+                    continue
+                sentence, subject, relation, object_, payload_bytes = payload
+                s_writer.writerow([sentence, subject, relation, object_])
+                krv_db_file.write(payload_bytes)
+                written += 1
+            print(f"Wrote {written}/{total_records} records")
+            return
 
-            subject, object_, relation = triple
+        pending = {}
+        next_idx = 0
+        processed = 0
 
-            # Generate embeddings
-            subject_embedding = embedding_model.encode(
-                subject,
-                truncate_dim=k_embed_dim,
-                convert_to_numpy=True,
-            )
-            object_embedding = embedding_model.encode(
-                object_,
-                truncate_dim=v_embed_dim,
-                convert_to_numpy=True,
-            )
-            relation_embedding = embedding_model.encode(
-                relation,
-                truncate_dim=r_embed_dim,
-                convert_to_numpy=True,
-            )
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=workers, initializer=_init_worker, initargs=(devices or [],)) as pool:
+            for idx, payload in pool.imap_unordered(_process_sentence, tasks, chunksize=1):
+                processed += 1
+                print(f"Processed record {processed}/{total_records}...")
+                pending[idx] = payload
 
-            # Ensure exact dimensions and little-endian f16 payload.
-            k_emb = np.zeros((k_embed_dim,), dtype="<f2")
-            r_emb = np.zeros((r_embed_dim,), dtype="<f2")
-            v_emb = np.zeros((v_embed_dim,), dtype="<f2")
+                while next_idx in pending:
+                    ordered_payload = pending.pop(next_idx)
+                    if ordered_payload is not None:
+                        sentence, subject, relation, object_, payload_bytes = ordered_payload
+                        s_writer.writerow([sentence, subject, relation, object_])
+                        krv_db_file.write(payload_bytes)
+                        written += 1
+                    next_idx += 1
 
-            subject_embedding = np.asarray(subject_embedding, dtype=np.float32).reshape(-1)
-            relation_embedding = np.asarray(relation_embedding, dtype=np.float32).reshape(-1)
-            object_embedding = np.asarray(object_embedding, dtype=np.float32).reshape(-1)
+        print(f"Wrote {written}/{total_records} records")
 
-            k_take = min(k_embed_dim, subject_embedding.shape[0])
-            r_take = min(r_embed_dim, relation_embedding.shape[0])
-            v_take = min(v_embed_dim, object_embedding.shape[0])
 
-            k_emb[:k_take] = subject_embedding[:k_take].astype("<f2")
-            r_emb[:r_take] = relation_embedding[:r_take].astype("<f2")
-            v_emb[:v_take] = object_embedding[:v_take].astype("<f2")
+def _default_workers():
+    if torch.cuda.is_available():
+        return max(1, torch.cuda.device_count())
+    return 1
 
-            # Save to databases
-            s_writer.writerow([sentence, subject, relation, object_])
-            krv_db_file.write(
-                k_emb.tobytes()
-                + r_emb.tobytes()
-                + v_emb.tobytes()
-            )
+
+def _default_devices(workers):
+    if not torch.cuda.is_available():
+        return []
+    gpus = torch.cuda.device_count()
+    return [f"cuda:{i % gpus}" for i in range(max(1, workers))]
 
 
 if __name__ == "__main__":
-    sentences = load_sentences(s_database_path, max_lines_to_extract)
-    generate_krv_database(sentences)
+    parser = ArgumentParser()
+    parser.add_argument("--workers", type=int, default=_default_workers(), help="Parallel worker processes")
+    parser.add_argument("--max-lines", type=int, default=max_lines_to_extract, help="Max number of source lines")
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default="",
+        help="Comma-separated device list (e.g. cuda:0,cuda:1 or cpu)",
+    )
+    args = parser.parse_args()
+
+    workers = max(1, args.workers)
+    if args.devices.strip():
+        devices = [d.strip() for d in args.devices.split(",") if d.strip()]
+    else:
+        devices = _default_devices(workers)
+
+    if workers > 1 and len(devices) <= 1:
+        print("Warning: multiple workers with a single device may not improve speed and can increase memory use.")
+
+    sentences = load_sentences(s_database_path, args.max_lines)
+    generate_krv_database(sentences, workers=workers, devices=devices)
