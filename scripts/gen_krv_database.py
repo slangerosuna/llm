@@ -1,6 +1,5 @@
 import csv
 import multiprocessing as mp
-import os
 from argparse import ArgumentParser
 
 import numpy as np
@@ -25,6 +24,16 @@ output_krv_database_path = "datasets/krv-database.bin"
 output_s_database_path = "datasets/s-database.csv"
 
 max_lines_to_extract = 16384
+
+
+def _unique_devices(devices):
+    seen = set()
+    out = []
+    for d in devices:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
 
 
 def _resolve_worker_device(worker_index, devices):
@@ -215,8 +224,28 @@ def generate_krv_database(sentences, workers=1, devices=None):
         next_idx = 0
         processed = 0
 
+        worker_devices = _unique_devices(devices or [])
+        if not worker_devices:
+            if torch.cuda.is_available():
+                worker_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+            else:
+                worker_devices = ["cpu"]
+
+        effective_workers = min(max(1, workers), len(worker_devices))
+        worker_devices = worker_devices[:effective_workers]
+
+        if effective_workers < workers:
+            print(
+                "Capping workers from "
+                f"{workers} to {effective_workers} to ensure models are loaded once per device."
+            )
+
         ctx = mp.get_context("spawn")
-        with ctx.Pool(processes=workers, initializer=_init_worker, initargs=(devices or [],)) as pool:
+        with ctx.Pool(
+            processes=effective_workers,
+            initializer=_init_worker,
+            initargs=(worker_devices,),
+        ) as pool:
             for idx, payload in pool.imap_unordered(_process_sentence, tasks, chunksize=1):
                 processed += 1
                 print(f"Processed record {processed}/{total_records}...")
@@ -236,7 +265,8 @@ def generate_krv_database(sentences, workers=1, devices=None):
 
 def _default_workers():
     if torch.cuda.is_available():
-        return max(1, 2 * torch.cuda.device_count())
+        # One worker per GPU keeps one model instance per device.
+        return max(1, torch.cuda.device_count())
     return 1
 
 
@@ -244,7 +274,8 @@ def _default_devices(workers):
     if not torch.cuda.is_available():
         return []
     gpus = torch.cuda.device_count()
-    return [f"cuda:{i % gpus}" for i in range(max(1, workers))]
+    max_workers = min(max(1, workers), gpus)
+    return [f"cuda:{i}" for i in range(max_workers)]
 
 
 if __name__ == "__main__":
@@ -258,8 +289,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--workers-per-gpu",
         type=int,
-        default=2,
-        help="When CUDA is available and --workers=0, spawn this many workers per GPU",
+        default=1,
+        help="When CUDA is available and --workers=0, target this many workers per GPU (capped to one load per device)",
     )
     parser.add_argument("--max-lines", type=int, default=max_lines_to_extract, help="Max number of source lines")
     parser.add_argument(
@@ -284,10 +315,9 @@ if __name__ == "__main__":
     else:
         devices = _default_devices(workers)
 
-    if workers > 1 and len(devices) == 1 and devices[0].startswith("cuda"):
-        print(f"Running {workers} worker processes on shared device {devices[0]}.")
-    elif workers > 1 and len(devices) <= 1:
-        print("Warning: multiple workers with a single device may not improve speed and can increase memory use.")
+    devices = _unique_devices(devices)
+    if len(devices) == 1 and devices[0].startswith("cuda"):
+        print(f"Using single-device mode on {devices[0]}: one model instance will be loaded.")
 
     sentences = load_sentences(s_database_path, args.max_lines)
     generate_krv_database(sentences, workers=workers, devices=devices)
