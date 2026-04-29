@@ -1010,15 +1010,14 @@ int run_train_command(const ParsedArgs& args) {
     train_cfg.focal_gamma = parse_float(get_flag(args, "focal-gamma"), "focal-gamma");
   }
 
-  if (!s_database_path.empty()) {
+  if (!s_database_path.empty() && !krv_database_path.empty()) {
     const std::vector<SentenceCsvRow> sentence_rows = load_sentence_krv_csv_rows(s_database_path);
     std::vector<KRVEmbeddingRecord> krv_rows;
-    if (!krv_database_path.empty()) {
-      krv_rows = load_krv_embedding_database(krv_database_path);
-      if (krv_rows.size() != sentence_rows.size()) {
-        throw std::runtime_error(
-            "KRV database row count does not match sentence database row count");
-      }
+
+    krv_rows = load_krv_embedding_database(krv_database_path);
+    if (krv_rows.size() != sentence_rows.size()) {
+      throw std::runtime_error(
+          "KRV database row count does not match sentence database row count");
     }
 
     train_cfg.sentence_krv_examples.clear();
@@ -1033,15 +1032,11 @@ int run_train_command(const ParsedArgs& args) {
           ex.token_ids.push_back(t.id);
         }
       }
-      if (!krv_rows.empty()) {
-        ex.key_embedding = fit_embedding_dim(krv_rows[i].k, model.config().qk_dim);
-        ex.relation_embedding = fit_embedding_dim(krv_rows[i].r, model.config().rel_dim);
-        ex.value_embedding = fit_embedding_dim(krv_rows[i].v, model.config().v_dim);
-      } else {
-        ex.key_embedding = sentence_embedding_hash(sentence_rows[i].k_text, model.config().qk_dim);
-        ex.relation_embedding = sentence_embedding_hash(sentence_rows[i].r_text, model.config().rel_dim);
-        ex.value_embedding = sentence_embedding_hash(sentence_rows[i].v_text, model.config().v_dim);
-      }
+
+      ex.key_embedding = fit_embedding_dim(krv_rows[i].k, model.config().qk_dim);
+      ex.relation_embedding = fit_embedding_dim(krv_rows[i].r, model.config().rel_dim);
+      ex.value_embedding = fit_embedding_dim(krv_rows[i].v, model.config().v_dim);
+
       train_cfg.sentence_krv_examples.push_back(std::move(ex));
     }
     std::cout << "Loaded sentence->KRV alignment examples: "
