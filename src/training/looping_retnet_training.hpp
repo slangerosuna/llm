@@ -1520,7 +1520,7 @@ public:
                     epoch_loss_series,
                     cfg_.epochs,
                     epoch_batch_losses,
-                    std::max<size_t>(1, ep_total));
+                    std::max<size_t>(1, epoch_batch_losses.size()));
 
                 const double elapsed_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - epoch_t0).count();
                 const double elapsed_s = std::max(1e-6, elapsed_ms / 1000.0);
