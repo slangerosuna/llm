@@ -2136,7 +2136,7 @@ public:
                     maybe_print(epoch_token_count > 0
                         ? epoch_loss_acc / static_cast<float>(epoch_token_count)
                         : 0.0f,
-                        std::min(batch_start + cfg_.batch_size, epoch_dataset.size() / cfg_.batch_size),
+                        std::min(batch_start + cfg_.batch_size, epoch_dataset.size()) / cfg_.batch_size,
                         epoch_dataset.size() / cfg_.batch_size);
 
                     if (cfg_.alternate_text_and_krv_batches) {
@@ -2821,7 +2821,7 @@ public:
                     maybe_print(epoch_token_count > 0
                         ? epoch_loss_acc / static_cast<float>(epoch_token_count)
                         : 0.0f,
-                        std::min(batch_start + cfg_.batch_size, epoch_dataset.size()),
+                        std::min(batch_start + cfg_.batch_size, epoch_dataset.size()) / cfg_.batch_size,
                         epoch_dataset.size() / cfg_.batch_size);
 
                     if (cfg_.alternate_text_and_krv_batches) {
