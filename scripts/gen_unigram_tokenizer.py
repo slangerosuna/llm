@@ -4,7 +4,7 @@ from math import log
 
 import csv
 
-corpus_path = "datasets/books_large_p1.txt"
+corpus_path = "datasets/train.csv"
 tokenizer_output_path = "models/unigram_tokenizer.csv"
 
 # for 100M model (the end goal), do 24576 tokens
@@ -12,15 +12,36 @@ tokenizer_output_path = "models/unigram_tokenizer.csv"
 tokenizer_vocab_size = 4096
 tokenizer_base_name = "xlnet/xlnet-base-cased"
 
-special_tokens = {"<unk>": 0}
+special_tokens = {
+    "<unk>": 0,  # unknown token
+    "<pad>": 0,  # padding token
+    "<bos>": 0,  # beginning of sentence
+    "<eos>": 0,  # end of sentence
+    "<sep>": 0,  # separator token (for sentence pairs)
+    "<cls>": 0,  # classification token (for sentence pairs)
+    "<toolcall>": 0,  # tool call token (for generation with tools)
+    "</toolcall>": 0,  # tool call end token (for generation with tools)
+    "<toolresponse>": 0,  # tool response token (for generation with tools)
+    "</toolresponse>": 0,  # tool response end token (for generation with tools)
+    "<think>": 0,  # thought token (for chain-of-thought generation)
+    "</think>": 0,  # thought end token (for chain-of-thought generation)
+    "<system>": 0,  # system message token (for chat)
+    "</system>": 0,  # system message end token (for chat)
+    "<user>": 0,  # user message token (for chat)
+    "</user>": 0,  # user message end token (for chat)
+    "<assistant>": 0,  # assistant message token (for chat)
+    "</assistant>": 0,  # assistant message end token (for chat)
+}
 
 tokenizer = AutoTokenizer.from_pretrained(tokenizer_base_name)
 
 word_freqs = defaultdict(int)
 
 with open(corpus_path, "r", encoding="utf-8") as corpus:
-    for line in corpus:
-        tokens = tokenizer.tokenize(line)
+    reader = csv.reader(corpus)
+    next(reader)  # skip header
+    for line in reader:
+        tokens = tokenizer.tokenize(line[2])
         for token in tokens:
             word_freqs[token] += 1
 

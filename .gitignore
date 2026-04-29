@@ -1,5 +1,5 @@
 .env
-venv
+.venv
 build
 build-container
 build-asan

@@ -417,6 +417,8 @@ std::string get_flag(const ParsedArgs& args, const std::string& long_name, const
   return "";
 }
 
+std::vector<std::string> parse_csv_row(const std::string& line);
+
 std::vector<std::string> load_dataset_lines(const std::string& path) {
   std::ifstream in(path);
   if (!in) {
@@ -429,13 +431,29 @@ std::vector<std::string> load_dataset_lines(const std::string& path) {
     if (!line.empty() && line.back() == '\r') {
       line.pop_back();
     }
-    if (!line.empty()) {
-      lines.push_back(line);
+    if (line.empty()) {
+      continue;
+    }
+
+    const std::vector<std::string> cols = parse_csv_row(line);
+    if (cols.size() < 3) {
+      continue;
+    }
+
+    if (lines.empty()
+        && to_lower(cols[0]) == "doc_id"
+        && to_lower(cols[1]) == "sent_id"
+        && to_lower(cols[2]) == "text") {
+      continue;
+    }
+
+    if (!cols[2].empty()) {
+      lines.push_back(cols[2]);
     }
   }
 
   if (lines.empty()) {
-    throw std::runtime_error("Dataset file has no non-empty lines: " + path);
+    throw std::runtime_error("Dataset CSV has no valid text rows (expected cols: doc_id,sent_id,text): " + path);
   }
   return lines;
 }
@@ -681,7 +699,7 @@ std::vector<std::vector<size_t>> tokenize_texts(
   std::vector<std::vector<size_t>> out;
   out.reserve(texts.size());
   for (const auto& text : texts) {
-    const auto toks = tokenizer.tokenize(text);
+    const auto toks = tokenizer.tokenize(text, TokenizationMode::Training);
     std::vector<size_t> ids;
     ids.reserve(toks.size());
     for (const auto& t : toks) {
@@ -742,35 +760,6 @@ void write_memory_module_from_dataset(
   graph.save_to_file(memory_module_path);
 }
 
-// Group lines into multi-sentence samples, randomly choosing a count in
-// [min_sentences, max_sentences] per group, then join with a space.
-std::vector<std::string> group_sentences(
-    const std::vector<std::string>& lines,
-    size_t min_sentences,
-    size_t max_sentences,
-    uint32_t seed)
-{
-  if (min_sentences < 1) min_sentences = 1;
-  if (max_sentences < min_sentences) max_sentences = min_sentences;
-
-  std::mt19937 rng(seed);
-  std::uniform_int_distribution<size_t> cnt_dist(min_sentences, max_sentences);
-
-  std::vector<std::string> groups;
-  size_t i = 0;
-  while (i < lines.size()) {
-    const size_t n = std::min(cnt_dist(rng), lines.size() - i);
-    std::string group;
-    for (size_t j = 0; j < n; ++j) {
-      if (j > 0) group += ' ';
-      group += strip_spaces_before_punct(lines[i + j]);
-    }
-    groups.push_back(std::move(group));
-    i += n;
-  }
-  return groups;
-}
-
 void print_usage(const char* program) {
   std::cout
       << "Usage:\n"
@@ -778,7 +767,7 @@ void print_usage(const char* program) {
       << "  " << program << " train -d DATASET -o OUTPUT [options]\n"
       << "  " << program << " infer -i MODEL [options]\n\n"
       << "Train required flags:\n"
-      << "  -d, --dataset PATH            Plain-text dataset (one sentence per line)\n"
+      << "  -d, --dataset PATH            CSV dataset with columns: doc_id,sent_id,text\n"
       << "  -o, --output PATH             Output model binary path\n"
       << "  -tok, --tokenizer PATH        Tokenizer vocab CSV (token,score)\n"
       << "  -m, --memory_module PATH      Save trained memory module graph path\n\n"
@@ -806,9 +795,6 @@ void print_usage(const char* program) {
       << "  -s, --s-database PATH         CSV sentence database (cols: sentence,K,R,V)\n"
       << "  -krv, --krv-database PATH     Binary KRV embedding DB aligned by sentence index\n"
       << "  --sentence-krv-loss-weight F  Weight for sentence->KRV alignment objective\n"
-      << "  --group-min-sentences N       Min sentences per training sample (default: 3)\n"
-      << "  --group-max-sentences N       Max sentences per training sample (default: 5)\n"
-      << "  --group-seed N                RNG seed for sentence grouping (default: 0)\n"
       << "  --model-dim N --qk-dim N --v-dim N --rel-dim N\n"
       << "  --hidden-layers N --max-steps N --decay F --model-seed N --train-seed N\n\n"
       << "Infer flags:\n"
@@ -1041,7 +1027,7 @@ int run_train_command(const ParsedArgs& args) {
       llm::training::looping::SentenceKRVExample ex;
       ex.sentence = sentence_rows[i].sentence;
       {
-        const auto toks = tokenizer.tokenize(ex.sentence);
+        const auto toks = tokenizer.tokenize(ex.sentence, TokenizationMode::Training);
         ex.token_ids.reserve(toks.size());
         for (const auto& t : toks) {
           ex.token_ids.push_back(t.id);
@@ -1062,24 +1048,10 @@ int run_train_command(const ParsedArgs& args) {
               << train_cfg.sentence_krv_examples.size() << "\n";
   }
 
-  const std::vector<std::string> raw_lines = load_dataset_lines(dataset_path);
-  std::cout << "Loaded raw lines: " << raw_lines.size() << "\n";
+    const std::vector<std::string> dataset_texts = load_dataset_lines(dataset_path);
+    std::cout << "Loaded dataset rows: " << dataset_texts.size() << "\n";
 
-  const size_t group_min = has_flag(args, "group-min-sentences")
-      ? parse_size(get_flag(args, "group-min-sentences"), "group-min-sentences")
-      : 3;
-  const size_t group_max = has_flag(args, "group-max-sentences")
-      ? parse_size(get_flag(args, "group-max-sentences"), "group-max-sentences")
-      : 5;
-  const uint32_t group_seed = has_flag(args, "group-seed")
-      ? parse_u32(get_flag(args, "group-seed"), "group-seed")
-      : 0u;
-
-  const std::vector<std::string> grouped_lines =
-      group_sentences(raw_lines, group_min, group_max, group_seed);
-  std::cout << "After grouping: " << grouped_lines.size() << " samples\n";
-
-  const auto tokenized_groups = tokenize_texts(grouped_lines, tokenizer);
+    const auto tokenized_groups = tokenize_texts(dataset_texts, tokenizer);
 
   const auto dataset = llm::training::looping::make_shift_dataset(tokenized_groups);
   if (dataset.empty()) {

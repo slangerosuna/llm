@@ -6,6 +6,34 @@
 #include <stdexcept>
 #include <string>
 
+namespace {
+
+const std::vector<std::string> kTrainingSpecialTokens = {
+    "</toolresponse>",
+    "</toolcall>",
+    "</assistant>",
+    "</system>",
+    "</think>",
+    "</user>",
+    "<toolresponse>",
+    "<toolcall>",
+    "<assistant>",
+    "<system>",
+    "<think>",
+    "<bos>",
+    "<eos>",
+    "<pad>",
+    "<sep>",
+    "<cls>",
+    "<user>",
+};
+
+bool is_space(char c) {
+    return std::isspace(static_cast<unsigned char>(c)) != 0;
+}
+
+}
+
 Tokenizer::Tokenizer(const std::string& vocabFile) {
     std::ifstream f(vocabFile);
     if (!f.is_open())
@@ -102,12 +130,67 @@ std::vector<Token> Tokenizer::encodeWord(const std::string& word) const {
     return tokens;
 }
 
-std::vector<Token> Tokenizer::tokenize(const std::string& text) const {
-    std::vector<Token> result;
-    for (const auto& word : preTokenize(text)) {
-        auto toks = encodeWord(word);
-        result.insert(result.end(), toks.begin(), toks.end());
+std::vector<Token> Tokenizer::tokenize(const std::string& text, TokenizationMode mode) const {
+    if (mode == TokenizationMode::Inference) {
+        std::vector<Token> result;
+        for (const auto& word : preTokenize(text)) {
+            auto toks = encodeWord(word);
+            result.insert(result.end(), toks.begin(), toks.end());
+        }
+        return result;
     }
+
+    std::vector<Token> result;
+    std::string normal;
+
+    auto flush_normal = [&]() {
+        if (normal.empty()) {
+            return;
+        }
+        for (const auto& word : preTokenize(normal)) {
+            auto toks = encodeWord(word);
+            result.insert(result.end(), toks.begin(), toks.end());
+        }
+        normal.clear();
+    };
+
+    for (size_t i = 0; i < text.size();) {
+        bool matched = false;
+        for (const auto& special : kTrainingSpecialTokens) {
+            const size_t n = special.size();
+            if (i + n > text.size()) {
+                continue;
+            }
+            if (text.compare(i, n, special) != 0) {
+                continue;
+            }
+
+            // Match only whole special tags, not substrings in larger words.
+            const bool left_ok = (i == 0) || is_space(text[i - 1]);
+            const bool right_ok = (i + n >= text.size()) || is_space(text[i + n]);
+            if (!left_ok || !right_ok) {
+                continue;
+            }
+
+            auto it = tokenMap.find(special);
+            if (it == tokenMap.end()) {
+                continue;
+            }
+
+            flush_normal();
+            result.push_back(it->second);
+            i += n;
+            matched = true;
+            break;
+        }
+
+        if (!matched) {
+            normal.push_back(text[i]);
+            ++i;
+        }
+    }
+
+    flush_normal();
     return result;
 }
 

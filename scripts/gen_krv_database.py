@@ -18,12 +18,12 @@ k_embed_dim = 256
 r_embed_dim = 128
 v_embed_dim = 256
 
-s_database_path = "datasets/books_large_p1.txt"
+s_database_path = "datasets/facts.json"
 
 output_krv_database_path = "krv-database.bin"
 output_s_database_path = "s-database.csv"
 
-total_lines_to_extract = 16384
+max_lines_to_extract = 16384
 
 
 def generate_krv_sentences(sentence):
@@ -97,10 +97,16 @@ def load_sentences(file_path, num_sentences):
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
+            # only take from "text": "..."
+            if line and line.startswith('"text": "'):
+                line = line[len('"text": "') : -1]  # remove the prefix and trailing quote
                 sentences.append(line)
                 if len(sentences) >= num_sentences:
                     break
+            #if line:
+            #    sentences.append(line)
+            #    if len(sentences) >= num_sentences:
+            #        break
     return sentences
 
 
@@ -175,5 +181,5 @@ def generate_krv_database(sentences):
 
 
 if __name__ == "__main__":
-    sentences = load_sentences(s_database_path, total_lines_to_extract)
+    sentences = load_sentences(s_database_path, max_lines_to_extract)
     generate_krv_database(sentences)
