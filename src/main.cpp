@@ -1249,7 +1249,7 @@ int run_infer_command(const ParsedArgs& args) {
       if (decoded.empty()) { continue; }
       bool all_ws = true;
       for (char c : decoded) {
-        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '▁') {
           all_ws = false;
           break;
         }
