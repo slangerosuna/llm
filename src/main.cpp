@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -916,6 +917,7 @@ void print_usage(const char* program) {
       << "  --force-output BOOL           Force OUTPUT action each step\n"
       << "  --use-parallel-retention BOOL Use parallel retention path\n"
       << "  --bias-against-whitespace F   Logit penalty subtracted from whitespace tokens (default: 0)\n"
+      << "  --temperature F               Sampling temperature; 0 = argmax (default: 0.7)\n"
       << "\n"
       << "Example:\n"
       << "  " << program << " train -i model.bin -o trained.bin -d dataset.txt --epochs 4096 --mode BackpropFull\n";
@@ -1222,6 +1224,9 @@ int run_infer_command(const ParsedArgs& args) {
              ? 10.0f
              : parse_float(get_flag(args, "bias-against-whitespace"), "bias-against-whitespace"))
       : 0.0f;
+  const float temperature = has_flag(args, "temperature")
+      ? parse_float(get_flag(args, "temperature"), "temperature")
+      : 0.7f;
 
   LoopingRetNet model = LoopingRetNet::load_from_file(model_path);
   if (model.config().char_vocab != tokenizer.vocab_size()) {
@@ -1273,20 +1278,44 @@ int run_infer_command(const ParsedArgs& args) {
     }
   }
 
-  // Pick the token with the highest biased logit score.
+  // Pick the token with the highest biased logit score, optionally sampling
+  // from the temperature-scaled softmax distribution.
+  std::mt19937 rng(std::random_device{}());
   const auto pick_biased = [&](const llm::arch::Vector& logits) -> size_t {
     if (logits.empty()) { return 0; }
-    size_t best = 0;
-    float best_val = static_cast<float>(logits[0])
-        - (whitespace_bias != 0.0f && !is_whitespace_token.empty() && is_whitespace_token[0]
-               ? whitespace_bias : 0.0f);
     const size_t n = std::min(logits.size(), is_whitespace_token.size());
-    for (size_t i = 1; i < n; ++i) {
-      const float v = static_cast<float>(logits[i])
+
+    // Apply whitespace bias and build float logit array.
+    std::vector<float> scores(n);
+    for (size_t i = 0; i < n; ++i) {
+      scores[i] = static_cast<float>(logits[i])
           - (whitespace_bias != 0.0f && is_whitespace_token[i] ? whitespace_bias : 0.0f);
-      if (v > best_val) { best_val = v; best = i; }
     }
-    return best;
+
+    // Argmax when temperature is 0.
+    if (temperature <= 0.0f) {
+      size_t best = 0;
+      for (size_t i = 1; i < n; ++i) {
+        if (scores[i] > scores[best]) { best = i; }
+      }
+      return best;
+    }
+
+    // Temperature-scaled softmax sampling.
+    float max_s = scores[0];
+    for (size_t i = 1; i < n; ++i) { max_s = std::max(max_s, scores[i]); }
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+      scores[i] = std::exp((scores[i] - max_s) / temperature);
+      sum += scores[i];
+    }
+    std::uniform_real_distribution<float> dist(0.0f, sum);
+    float r = dist(rng);
+    for (size_t i = 0; i < n; ++i) {
+      r -= scores[i];
+      if (r <= 0.0f) { return i; }
+    }
+    return n - 1;
   };
 
   llm::arch::KVState recurrent_state;
