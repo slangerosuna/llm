@@ -525,18 +525,18 @@ class LoopingRetNetSGDTrainer {
             kGraphWidth,
             kGraphHeight,
             0.0f,
-            6.0f,
-            "Loss by Epoch (0..6)");
+            9.0f,
+            "Loss by Epoch (0..9)");
         const auto right = render_loss_graph(
             batch_losses,
             std::max<size_t>(1, batch_span),
             kGraphWidth,
             kGraphHeight,
             0.0f,
-            6.0f,
-            "Loss by Batch This Epoch (0..6)");
+            9.0f,
+            "Loss by Batch This Epoch (0..9)");
 
-        std::cout << "\x1b[2J\x1b[H";
+        // std::cout << "\x1b[2J\x1b[H";
         for (size_t r = 0; r < kGraphHeight; ++r) {
             std::cout << left[r] << "||" << right[r] << "\n";
         }
