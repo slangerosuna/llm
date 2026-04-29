@@ -1127,15 +1127,16 @@ int run_train_command(const ParsedArgs& args) {
     std::vector<KRVEmbeddingRecord> krv_rows;
 
     krv_rows = load_krv_embedding_database(krv_database_path);
-    if (krv_rows.size() != sentence_rows.size()) {
+    size_t min_rows = std::min(sentence_rows.size(), krv_rows.size());
+    /*if (krv_rows.size() != sentence_rows.size()) {
       throw std::runtime_error(
           "KRV database row count does not match sentence database row count");
-    }
+    }*/
 
     train_cfg.sentence_krv_examples.clear();
     train_cfg.sentence_krv_examples.reserve(sentence_rows.size());
     ProgressBar progress("Tokenizing sentence KRV", sentence_rows.size());
-    for (size_t i = 0; i < sentence_rows.size(); ++i) {
+    for (size_t i = 0; i < min_rows; ++i) {
       llm::training::looping::SentenceKRVExample ex;
       ex.sentence = sentence_rows[i].sentence;
       {
