@@ -157,6 +157,8 @@ struct TrainConfig {
     // Optional sentence->KRV embedding alignment training.
     std::vector<SentenceKRVExample> sentence_krv_examples;
     float sentence_krv_loss_weight = 1.0f;
+    bool alternate_text_and_krv_batches = true;
+    size_t sentence_krv_batch_size = 0; // 0 => use batch_size
 
     memory::MemoryConfig memory_cfg{};
 };
@@ -1228,10 +1230,33 @@ public:
             }
         };
 
-        auto run_sentence_krv_alignment_epoch = [&](size_t epoch_1_based, float lr_epoch) -> std::pair<float, size_t> {
+        std::vector<size_t> sentence_krv_order;
+        size_t sentence_krv_cursor = 0;
+
+        auto reset_sentence_krv_order = [&](std::mt19937& local_rng) {
+            sentence_krv_order.clear();
+            sentence_krv_cursor = 0;
+            if (cfg_.sentence_krv_examples.empty()) {
+                return;
+            }
+            sentence_krv_order.resize(cfg_.sentence_krv_examples.size());
+            for (size_t i = 0; i < sentence_krv_order.size(); ++i) {
+                sentence_krv_order[i] = i;
+            }
+            std::shuffle(sentence_krv_order.begin(), sentence_krv_order.end(), local_rng);
+        };
+
+        auto run_sentence_krv_alignment_batch = [&](size_t epoch_1_based, float lr_epoch) -> std::pair<float, size_t> {
             (void)lr_epoch;
             if (cfg_.sentence_krv_examples.empty() || cfg_.sentence_krv_loss_weight <= 0.0f) {
                 return {0.0f, 0};
+            }
+
+            if (sentence_krv_order.empty()) {
+                reset_sentence_krv_order(rng);
+                if (sentence_krv_order.empty()) {
+                    return {0.0f, 0};
+                }
             }
 
             auto& mem_w = model.memory_entry_weights();
@@ -1257,7 +1282,19 @@ public:
             float loss_acc = 0.0f;
             size_t used = 0;
 
-            for (const auto& ex : cfg_.sentence_krv_examples) {
+            const size_t krv_batch_size = std::max<size_t>(
+                1,
+                (cfg_.sentence_krv_batch_size == 0)
+                    ? cfg_.batch_size
+                    : cfg_.sentence_krv_batch_size);
+            const size_t attempts = std::min(krv_batch_size, sentence_krv_order.size());
+
+            for (size_t bi = 0; bi < attempts; ++bi) {
+                if (sentence_krv_cursor >= sentence_krv_order.size()) {
+                    std::shuffle(sentence_krv_order.begin(), sentence_krv_order.end(), rng);
+                    sentence_krv_cursor = 0;
+                }
+                const auto& ex = cfg_.sentence_krv_examples[sentence_krv_order[sentence_krv_cursor++]];
                 if (ex.token_ids.empty()) {
                     continue;
                 }
@@ -1430,6 +1467,8 @@ public:
             size_t epoch_example_count = 0;
             size_t objective_evals = 0;
             size_t query_events = 0;
+            float sentence_krv_epoch_loss_acc = 0.0f;
+            size_t sentence_krv_epoch_used = 0;
             double seq_forward_ms = 0.0;
             float gradcheck_rel_err_sum = 0.0f;
             size_t gradcheck_count = 0;
@@ -1453,6 +1492,7 @@ public:
             }
             std::shuffle(epoch_dataset_storage.begin(), epoch_dataset_storage.end(), rng);
             const std::vector<SequenceExample>& epoch_dataset = epoch_dataset_storage;
+            reset_sentence_krv_order(rng);
 
             const char* mode_name_ep = (cfg_.mode == TrainMode::FiniteDifference)
                 ? "FD"
@@ -2098,6 +2138,15 @@ public:
                         : 0.0f,
                         std::min(batch_start + cfg_.batch_size, epoch_dataset.size()),
                         epoch_dataset.size());
+
+                    if (cfg_.alternate_text_and_krv_batches) {
+                        const auto [krv_batch_loss, krv_used] =
+                            run_sentence_krv_alignment_batch(epoch + 1, lr_epoch);
+                        if (krv_used > 0 && std::isfinite(krv_batch_loss)) {
+                            sentence_krv_epoch_loss_acc += krv_batch_loss * static_cast<float>(krv_used);
+                            sentence_krv_epoch_used += krv_used;
+                        }
+                    }
                 }
 
                 const auto bp_t1 = std::chrono::steady_clock::now();
@@ -2774,6 +2823,15 @@ public:
                         : 0.0f,
                         std::min(batch_start + cfg_.batch_size, epoch_dataset.size()),
                         epoch_dataset.size());
+
+                    if (cfg_.alternate_text_and_krv_batches) {
+                        const auto [krv_batch_loss, krv_used] =
+                            run_sentence_krv_alignment_batch(epoch + 1, lr_epoch);
+                        if (krv_used > 0 && std::isfinite(krv_batch_loss)) {
+                            sentence_krv_epoch_loss_acc += krv_batch_loss * static_cast<float>(krv_used);
+                            sentence_krv_epoch_used += krv_used;
+                        }
+                    }
                 }
 
                 const auto bp_t1 = std::chrono::steady_clock::now();
@@ -2787,13 +2845,47 @@ public:
                 }
             }
 
-            const auto [sentence_krv_loss, sentence_krv_used] =
-                run_sentence_krv_alignment_epoch(epoch + 1, lr_epoch);
-            if (sentence_krv_used > 0 && std::isfinite(sentence_krv_loss)) {
-                if (std::isfinite(epoch_loss)) {
-                    epoch_loss += sentence_krv_loss;
-                } else {
-                    epoch_loss = sentence_krv_loss;
+            if (cfg_.alternate_text_and_krv_batches) {
+                if (sentence_krv_epoch_used > 0) {
+                    const float sentence_krv_loss =
+                        sentence_krv_epoch_loss_acc / static_cast<float>(sentence_krv_epoch_used);
+                    if (std::isfinite(sentence_krv_loss)) {
+                        if (std::isfinite(epoch_loss)) {
+                            epoch_loss += sentence_krv_loss;
+                        } else {
+                            epoch_loss = sentence_krv_loss;
+                        }
+                    }
+                }
+            } else {
+                float epoch_krv_loss_acc = 0.0f;
+                size_t epoch_krv_used = 0;
+                if (!cfg_.sentence_krv_examples.empty()) {
+                    const size_t krv_batch_size = std::max<size_t>(
+                        1,
+                        (cfg_.sentence_krv_batch_size == 0)
+                            ? cfg_.batch_size
+                            : cfg_.sentence_krv_batch_size);
+                    const size_t krv_batches =
+                        (cfg_.sentence_krv_examples.size() + krv_batch_size - 1) / krv_batch_size;
+                    for (size_t kb = 0; kb < krv_batches; ++kb) {
+                        const auto [krv_batch_loss, krv_used] =
+                            run_sentence_krv_alignment_batch(epoch + 1, lr_epoch);
+                        if (krv_used > 0 && std::isfinite(krv_batch_loss)) {
+                            epoch_krv_loss_acc += krv_batch_loss * static_cast<float>(krv_used);
+                            epoch_krv_used += krv_used;
+                        }
+                    }
+                }
+
+                if (epoch_krv_used > 0) {
+                    const float sentence_krv_loss =
+                        epoch_krv_loss_acc / static_cast<float>(epoch_krv_used);
+                    if (std::isfinite(epoch_loss)) {
+                        epoch_loss += sentence_krv_loss;
+                    } else {
+                        epoch_loss = sentence_krv_loss;
+                    }
                 }
             }
 

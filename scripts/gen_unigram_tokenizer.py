@@ -13,24 +13,24 @@ tokenizer_vocab_size = 4096
 tokenizer_base_name = "xlnet/xlnet-base-cased"
 
 special_tokens = {
-    "<unk>": 0,  # unknown token
-    "<pad>": 0,  # padding token
-    "<bos>": 0,  # beginning of sentence
-    "<eos>": 0,  # end of sentence
-    "<sep>": 0,  # separator token (for sentence pairs)
-    "<cls>": 0,  # classification token (for sentence pairs)
-    "<toolcall>": 0,  # tool call token (for generation with tools)
-    "</toolcall>": 0,  # tool call end token (for generation with tools)
-    "<toolresponse>": 0,  # tool response token (for generation with tools)
-    "</toolresponse>": 0,  # tool response end token (for generation with tools)
-    "<think>": 0,  # thought token (for chain-of-thought generation)
-    "</think>": 0,  # thought end token (for chain-of-thought generation)
-    "<system>": 0,  # system message token (for chat)
-    "</system>": 0,  # system message end token (for chat)
-    "<user>": 0,  # user message token (for chat)
-    "</user>": 0,  # user message end token (for chat)
-    "<assistant>": 0,  # assistant message token (for chat)
-    "</assistant>": 0,  # assistant message end token (for chat)
+    "<unk>": 1,  # unknown token
+    "<pad>": 1,  # padding token
+    "<bos>": 1,  # beginning of sentence
+    "<eos>": 1,  # end of sentence
+    "<sep>": 1,  # separator token (for sentence pairs)
+    "<cls>": 1,  # classification token (for sentence pairs)
+    "<toolcall>": 1,  # tool call token (for generation with tools)
+    "</toolcall>": 1,  # tool call end token (for generation with tools)
+    "<toolresponse>": 1,  # tool response token (for generation with tools)
+    "</toolresponse>": 1,  # tool response end token (for generation with tools)
+    "<think>": 1,  # thought token (for chain-of-thought generation)
+    "</think>": 1,  # thought end token (for chain-of-thought generation)
+    "<system>": 1,  # system message token (for chat)
+    "</system>": 1,  # system message end token (for chat)
+    "<user>": 1,  # user message token (for chat)
+    "</user>": 1,  # user message end token (for chat)
+    "<assistant>": 1,  # assistant message token (for chat)
+    "</assistant>": 1,  # assistant message end token (for chat)
 }
 
 tokenizer = AutoTokenizer.from_pretrained(tokenizer_base_name)
