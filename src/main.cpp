@@ -803,7 +803,9 @@ std::vector<std::vector<size_t>> tokenize_texts(
     const Tokenizer& tokenizer) {
   std::vector<std::vector<size_t>> out;
   out.reserve(texts.size());
-  for (const auto& text : texts) {
+  ProgressBar progress("Tokenizing dataset", texts.size());
+  for (size_t i = 0; i < texts.size(); ++i) {
+    const auto& text = texts[i];
     const auto toks = tokenizer.tokenize(text, TokenizationMode::Training);
     std::vector<size_t> ids;
     ids.reserve(toks.size());
@@ -811,7 +813,9 @@ std::vector<std::vector<size_t>> tokenize_texts(
       ids.push_back(t.id);
     }
     out.push_back(std::move(ids));
+    progress.update(i + 1);
   }
+  progress.finish();
   return out;
 }
 
@@ -1127,6 +1131,7 @@ int run_train_command(const ParsedArgs& args) {
 
     train_cfg.sentence_krv_examples.clear();
     train_cfg.sentence_krv_examples.reserve(sentence_rows.size());
+    ProgressBar progress("Tokenizing sentence KRV", sentence_rows.size());
     for (size_t i = 0; i < sentence_rows.size(); ++i) {
       llm::training::looping::SentenceKRVExample ex;
       ex.sentence = sentence_rows[i].sentence;
@@ -1143,7 +1148,9 @@ int run_train_command(const ParsedArgs& args) {
       ex.value_embedding = fit_embedding_dim(krv_rows[i].v, model.config().v_dim);
 
       train_cfg.sentence_krv_examples.push_back(std::move(ex));
+      progress.update(i + 1);
     }
+    progress.finish();
     std::cout << "Loaded sentence->KRV alignment examples: "
               << train_cfg.sentence_krv_examples.size() << "\n";
   }
