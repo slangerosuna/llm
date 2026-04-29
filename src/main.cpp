@@ -1242,14 +1242,29 @@ int run_infer_command(const ParsedArgs& args) {
   }
 
   // Build whitespace token mask for logit bias.
+  // Use token_text() (raw vocab entry) rather than decode() so that tokens
+  // whose entire surface form is the word-boundary prefix ▁ (U+2581,
+  // \xe2\x96\x81) are correctly identified as whitespace.  decode() strips
+  // a leading space from the output, so a lone ▁ token comes back as ""
+  // and would be missed.
   std::vector<bool> is_whitespace_token(tokenizer.vocab_size(), false);
   if (whitespace_bias != 0.0f) {
     for (size_t id = 0; id < tokenizer.vocab_size(); ++id) {
-      const std::string decoded = tokenizer.decode({id});
-      if (decoded.empty()) { continue; }
+      const std::string raw = tokenizer.token_text(id);
+      if (raw.empty()) { continue; }
       bool all_ws = true;
-      for (char c : decoded) {
-        if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '▁') {
+      size_t ci = 0;
+      while (ci < raw.size()) {
+        const unsigned char c = static_cast<unsigned char>(raw[ci]);
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+          ++ci;
+        } else if (c == 0xe2u
+                   && ci + 2 < raw.size()
+                   && static_cast<unsigned char>(raw[ci + 1]) == 0x96u
+                   && static_cast<unsigned char>(raw[ci + 2]) == 0x81u) {
+          // ▁ U+2581 – word-boundary prefix that decodes as a space
+          ci += 3;
+        } else {
           all_ws = false;
           break;
         }
