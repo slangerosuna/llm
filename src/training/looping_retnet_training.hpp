@@ -58,7 +58,7 @@ enum class TrainOptimizer : uint8_t {
 
 struct TrainConfig {
     TrainMode mode = TrainMode::BackpropFull;
-    TrainOptimizer optimizer = TrainOptimizer::Adam;
+    TrainOptimizer optimizer = TrainOptimizer::Muon;
     size_t epochs = 256;
     float learning_rate = 3.0e-4f;      // peak LR after warmup (Adam-safe default)
     float min_learning_rate = 1e-6f;  // absolute LR floor
@@ -85,7 +85,7 @@ struct TrainConfig {
     size_t min_grad_coordinate_samples = 128;
 
     // Minibatch support used by both modes where applicable.
-    size_t batch_size = 256;
+    size_t batch_size = 512;
     // Host-side parallelism for per-example work in minibatches.
     // 0 = auto (use hardware_concurrency), 1 = force single-thread.
     size_t host_threads = 0;
@@ -424,9 +424,9 @@ class LoopingRetNetSGDTrainer {
         }
         lines[x_axis_row][y_axis_col] = '+';
 
-        // y-axis fixed labels required by the prompt: [0, 6].
+        // y-axis fixed labels required by the prompt: [0, 9].
         if (width >= 4) {
-            lines[y_plot_top][1] = '6';
+            lines[y_plot_top][1] = '9';
             lines[y_plot_bottom][1] = '0';
         }
 
@@ -1499,15 +1499,15 @@ public:
                 : (cfg_.mode == TrainMode::BackpropHeads ? "BP_HEADS" : "BP_FULL");
 
             auto maybe_print = [&](float cur_loss, size_t ep_done, size_t ep_total) {
-                const auto now = std::chrono::steady_clock::now();
-                const double since_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - last_print_time).count();
-                if (since_ms < 100.0) return;
-                last_print_time = now;
-
                 if (ep_done > last_recorded_progress) {
                     epoch_batch_losses.push_back(cur_loss);
                     last_recorded_progress = ep_done;
                 }
+
+                const auto now = std::chrono::steady_clock::now();
+                const double since_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - last_print_time).count();
+                if (since_ms < 100.0) return;
+                last_print_time = now;
 
                 std::vector<float> epoch_loss_series;
                 epoch_loss_series.reserve(history.size() + 1);
