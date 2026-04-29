@@ -915,6 +915,7 @@ void print_usage(const char* program) {
       << "  --enable-query BOOL           Allow QUERY_MEMORY action during inference\n"
       << "  --force-output BOOL           Force OUTPUT action each step\n"
       << "  --use-parallel-retention BOOL Use parallel retention path\n"
+      << "  --bias-against-whitespace F   Logit penalty subtracted from whitespace tokens (default: 0)\n"
       << "\n"
       << "Example:\n"
       << "  " << program << " train -i model.bin -o trained.bin -d dataset.txt --epochs 4096 --mode BackpropFull\n";
@@ -1216,6 +1217,11 @@ int run_infer_command(const ParsedArgs& args) {
   const bool use_parallel_retention = has_flag(args, "use-parallel-retention")
       ? parse_bool(get_flag(args, "use-parallel-retention"))
       : false;
+  const float whitespace_bias = has_flag(args, "bias-against-whitespace")
+      ? (get_flag(args, "bias-against-whitespace") == "true"
+             ? 10.0f
+             : parse_float(get_flag(args, "bias-against-whitespace"), "bias-against-whitespace"))
+      : 0.0f;
 
   LoopingRetNet model = LoopingRetNet::load_from_file(model_path);
   if (model.config().char_vocab != tokenizer.vocab_size()) {
@@ -1234,6 +1240,39 @@ int run_infer_command(const ParsedArgs& args) {
     graph.load_from_file(memory_module_path, spatial_map);
     std::cout << "Loaded memory module from: " << memory_module_path << "\n";
   }
+
+  // Build whitespace token mask for logit bias.
+  std::vector<bool> is_whitespace_token(tokenizer.vocab_size(), false);
+  if (whitespace_bias != 0.0f) {
+    for (size_t id = 0; id < tokenizer.vocab_size(); ++id) {
+      const std::string decoded = tokenizer.decode({id});
+      if (decoded.empty()) { continue; }
+      bool all_ws = true;
+      for (char c : decoded) {
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+          all_ws = false;
+          break;
+        }
+      }
+      is_whitespace_token[id] = all_ws;
+    }
+  }
+
+  // Pick the token with the highest biased logit score.
+  const auto pick_biased = [&](const llm::arch::Vector& logits) -> size_t {
+    if (logits.empty()) { return 0; }
+    size_t best = 0;
+    float best_val = static_cast<float>(logits[0])
+        - (whitespace_bias != 0.0f && !is_whitespace_token.empty() && is_whitespace_token[0]
+               ? whitespace_bias : 0.0f);
+    const size_t n = std::min(logits.size(), is_whitespace_token.size());
+    for (size_t i = 1; i < n; ++i) {
+      const float v = static_cast<float>(logits[i])
+          - (whitespace_bias != 0.0f && is_whitespace_token[i] ? whitespace_bias : 0.0f);
+      if (v > best_val) { best_val = v; best = i; }
+    }
+    return best;
+  };
 
   llm::arch::KVState recurrent_state;
   llm::arch::AttentionMemory chrono_kv_cache;
@@ -1289,7 +1328,7 @@ int run_infer_command(const ParsedArgs& args) {
         kInferForcedLoops,
         use_parallel_retention,
         kInferWriteMemory);
-    current = step.output_token;
+    current = pick_biased(step.logits);
     generated_ids.push_back(current);
   }
 
