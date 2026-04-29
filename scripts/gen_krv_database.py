@@ -79,10 +79,16 @@ Sentence: "{sentence}"
     for line in response.splitlines():
         if line.startswith("Subject:"):
             subject = line[len("Subject:") :].strip()
+        elif line.startswith("- Subject:"):
+            subject = line[len("- Subject:") :].strip()
         elif line.startswith("Object:"):
             object_ = line[len("Object:") :].strip()
+        elif line.startswith("- Object:"):
+            object_ = line[len("- Object:") :].strip()
         elif line.startswith("Relation:"):
             relation = line[len("Relation:") :].strip()
+        elif line.startswith("- Relation:"):
+            relation = line[len("- Relation:") :].strip()
 
     if subject is None or object_ is None or relation is None:
         print(f"Failed to extract triple from sentence: {sentence}")
