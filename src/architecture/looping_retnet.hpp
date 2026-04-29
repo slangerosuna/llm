@@ -3,9 +3,11 @@
 // looping_retnet.hpp
 //
 // LoopingRetNet: token-based language model that combines:
-//   • A RetNet recurrent core (recurrent mode, one step per character).
-//   • An Attention module used *only* to read from long-term graph memory via
-//     AttentionMemory (not for in-sequence context).
+//   • A RetNet recurrent core (recurrent mode, one step per token).
+//   • An Attention head used to read and write to and from long-term graph
+//     memory via AttentionMemory (not for in-sequence context).
+//   • A second attention head with a separate cache for "chrono" memory,
+//     which is purely recency-based and not written to by the model.
 //   • A 4-class action head that chooses on every inner iteration:
 //       0 – OUTPUT:        emit a token and advance to the next input token.
 //       1 – QUERY_MEMORY:  run a multihop graph query, inject results into the

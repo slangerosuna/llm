@@ -31,9 +31,10 @@ def generate_krv_sentences(sentence):
 Extract a semantic triple (Subject, Object, Relation) from the sentence.
 
 Definitions:
-- Subject: the entity performing the action (the agent), even if the sentence is in passive voice
-- Object: the entity receiving the action
-- Relation: a concise verb phrase describing the action from Subject to Object
+
+Subject: the entity performing the action (the agent), even if the sentence is in passive voice
+Object: the entity receiving the action
+Relation: a concise verb phrase describing the action from Subject to Object
 
 Rules:
 - Convert passive voice to active voice before extracting
@@ -130,7 +131,14 @@ def generate_krv_database(sentences):
         # padding
         krv_db_file.write((0).to_bytes(2, byteorder="little"))
 
+        total_records = len(sentences)
+        current_record = 0
+
         for sentence in sentences:
+            current_record += 1
+            if current_record % 100 == 0:
+                print(f"Processing record {current_record}/{total_records}...")
+
             triple = generate_krv_sentences(sentence)
             if triple is None:
                 continue
