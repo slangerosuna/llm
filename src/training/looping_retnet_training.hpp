@@ -1520,7 +1520,7 @@ public:
                     epoch_loss_series,
                     cfg_.epochs,
                     epoch_batch_losses,
-                    std::max<size_t>(1, epoch_batch_losses.size()));
+                    std::max<size_t>(1, ep_total));
 
                 const double elapsed_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - epoch_t0).count();
                 const double elapsed_s = std::max(1e-6, elapsed_ms / 1000.0);
@@ -2136,8 +2136,8 @@ public:
                     maybe_print(epoch_token_count > 0
                         ? epoch_loss_acc / static_cast<float>(epoch_token_count)
                         : 0.0f,
-                        std::min(batch_start + cfg_.batch_size, epoch_dataset.size()),
-                        epoch_dataset.size());
+                        std::min(batch_start + cfg_.batch_size, epoch_dataset.size() / cfg_.batch_size),
+                        epoch_dataset.size() / cfg_.batch_size);
 
                     if (cfg_.alternate_text_and_krv_batches) {
                         const auto [krv_batch_loss, krv_used] =
@@ -2972,7 +2972,7 @@ public:
             }
             inter_loss_delta = loss_delta;
             inter_unstable = unstable_epoch;
-            maybe_print(epoch_loss, epoch_dataset.size(), epoch_dataset.size());
+            maybe_print(epoch_loss, epoch_dataset.size() / cfg_.batch_size, epoch_dataset.size() / cfg_.batch_size);
         }
 
         return history;
