@@ -2,6 +2,7 @@
 #include <sycl/sycl.hpp>
 #include <csignal>
 #include <cstdlib>
+#include <filesystem>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -275,6 +276,65 @@ using llm::training::looping::TrainConfig;
 using llm::training::looping::TrainMode;
 using llm::training::looping::TrainOptimizer;
 
+uintmax_t safe_file_size(const std::string& path) {
+  try {
+    return std::filesystem::file_size(path);
+  } catch (...) {
+    return 0;
+  }
+}
+
+class ProgressBar {
+ public:
+  ProgressBar(std::string label, uintmax_t total_bytes)
+      : label_(std::move(label)), total_bytes_(total_bytes) {
+    if (total_bytes_ > 0) {
+      render(0);
+    }
+  }
+
+  void update(uintmax_t processed_bytes) {
+    if (total_bytes_ == 0 || finished_) {
+      return;
+    }
+    if (processed_bytes > total_bytes_) {
+      processed_bytes = total_bytes_;
+    }
+    const int pct = static_cast<int>((processed_bytes * 100u) / total_bytes_);
+    if (pct == last_pct_) {
+      return;
+    }
+    render(pct);
+  }
+
+  void finish() {
+    if (total_bytes_ == 0 || finished_) {
+      return;
+    }
+    render(100);
+    std::cerr << "\n";
+    finished_ = true;
+  }
+
+ private:
+  void render(int pct) {
+    static constexpr size_t kBarWidth = 30;
+    const size_t filled = (static_cast<size_t>(pct) * kBarWidth) / 100u;
+    std::cerr << "\r" << label_ << " [";
+    for (size_t i = 0; i < kBarWidth; ++i) {
+      std::cerr << (i < filled ? '=' : ' ');
+    }
+    std::cerr << "] " << pct << "%";
+    std::cerr.flush();
+    last_pct_ = pct;
+  }
+
+  std::string label_;
+  uintmax_t total_bytes_ = 0;
+  int last_pct_ = -1;
+  bool finished_ = false;
+};
+
 struct ParsedArgs {
   std::vector<std::string> positionals;
   std::unordered_map<std::string, std::string> flags;
@@ -425,9 +485,20 @@ std::vector<std::string> load_dataset_lines(const std::string& path) {
     throw std::runtime_error("Failed to open dataset file: " + path);
   }
 
+  ProgressBar progress("Loading dataset CSV", safe_file_size(path));
+  uintmax_t fallback_bytes = 0;
+
   std::vector<std::string> lines;
   std::string line;
   while (std::getline(in, line)) {
+    fallback_bytes += static_cast<uintmax_t>(line.size() + 1);
+    const std::streampos pos = in.tellg();
+    if (pos >= 0) {
+      progress.update(static_cast<uintmax_t>(pos));
+    } else {
+      progress.update(fallback_bytes);
+    }
+
     if (!line.empty() && line.back() == '\r') {
       line.pop_back();
     }
@@ -451,6 +522,8 @@ std::vector<std::string> load_dataset_lines(const std::string& path) {
       lines.push_back(cols[2]);
     }
   }
+
+  progress.finish();
 
   if (lines.empty()) {
     throw std::runtime_error("Dataset CSV has no valid text rows (expected cols: doc_id,sent_id,text): " + path);
@@ -498,9 +571,20 @@ load_sentence_krv_csv_rows(const std::string& path) {
     throw std::runtime_error("Failed to open sentence database CSV: " + path);
   }
 
+  ProgressBar progress("Loading sentence CSV", safe_file_size(path));
+  uintmax_t fallback_bytes = 0;
+
   std::vector<SentenceCsvRow> rows;
   std::string line;
   while (std::getline(in, line)) {
+    fallback_bytes += static_cast<uintmax_t>(line.size() + 1);
+    const std::streampos pos = in.tellg();
+    if (pos >= 0) {
+      progress.update(static_cast<uintmax_t>(pos));
+    } else {
+      progress.update(fallback_bytes);
+    }
+
     if (!line.empty() && line.back() == '\r') {
       line.pop_back();
     }
@@ -521,6 +605,8 @@ load_sentence_krv_csv_rows(const std::string& path) {
     ex.v_text = cols[3];
     rows.push_back(std::move(ex));
   }
+
+  progress.finish();
 
   if (rows.empty()) {
     throw std::runtime_error("Sentence database CSV has no valid rows: " + path);
@@ -587,8 +673,12 @@ std::vector<KRVEmbeddingRecord> load_krv_embedding_database(const std::string& p
     throw std::runtime_error("Failed to open KRV database: " + path);
   }
 
+  ProgressBar progress("Loading KRV binary", safe_file_size(path));
+  uintmax_t fallback_bytes = 0;
+
   constexpr uint64_t kMagic = 0x4B5256454D424544ULL; // KRVEMBED
   const uint64_t magic = read_u64_le(in);
+  fallback_bytes += 8;
   if (!in || magic != kMagic) {
     throw std::runtime_error("Invalid KRV database magic in: " + path);
   }
@@ -597,6 +687,8 @@ std::vector<KRVEmbeddingRecord> load_krv_embedding_database(const std::string& p
   const uint16_t r_len = read_u16_le(in);
   const uint16_t v_len = read_u16_le(in);
   (void)read_u16_le(in); // padding
+  fallback_bytes += 8;
+  progress.update(fallback_bytes);
   if (!in || k_len == 0 || r_len == 0 || v_len == 0) {
     throw std::runtime_error("Invalid KRV database header in: " + path);
   }
@@ -612,21 +704,34 @@ std::vector<KRVEmbeddingRecord> load_krv_embedding_database(const std::string& p
     for (size_t i = 0; i < k_len; ++i) {
       if (!in.good()) { ok = false; break; }
       rec.k[i] = fp16_to_float(read_u16_le(in));
+      fallback_bytes += 2;
     }
     for (size_t i = 0; ok && i < r_len; ++i) {
       if (!in.good()) { ok = false; break; }
       rec.r[i] = fp16_to_float(read_u16_le(in));
+      fallback_bytes += 2;
     }
     for (size_t i = 0; ok && i < v_len; ++i) {
       if (!in.good()) { ok = false; break; }
       rec.v[i] = fp16_to_float(read_u16_le(in));
+      fallback_bytes += 2;
     }
 
     if (!ok) {
       break;
     }
+
+    const std::streampos pos = in.tellg();
+    if (pos >= 0) {
+      progress.update(static_cast<uintmax_t>(pos));
+    } else {
+      progress.update(fallback_bytes);
+    }
+
     rows.push_back(std::move(rec));
   }
+
+  progress.finish();
 
   if (rows.empty()) {
     throw std::runtime_error("KRV database contains no embedding rows: " + path);
