@@ -86,11 +86,11 @@ std::vector<std::string> Tokenizer::preTokenize(const std::string& text) const {
     std::vector<std::string> words;
     size_t i = 0;
     while (i < text.size()) {
-        while (i < text.size() && std::isspace((unsigned char)text[i])) ++i;
+        while (i < text.size() && (std::isspace((unsigned char)text[i])) != 0) ++i;
         if (i >= text.size()) break;
         size_t start = i;
-        while (i < text.size() && !std::isspace((unsigned char)text[i])) ++i;
-        words.push_back("_" + text.substr(start, i - start));
+        while (i < text.size() && (std::isspace((unsigned char)text[i])) == 0) ++i;
+        words.push_back("▁" + text.substr(start, i - start));
     }
     return words;
 }
@@ -214,7 +214,7 @@ std::string Tokenizer::decode(const std::vector<size_t>& ids) const {
     for (size_t id : ids) {
         const std::string piece = token_text(id);
         for (char c : piece) {
-            if (c == '_') {
+            if (c == '▁') {
                 out.push_back(' ');
             } else {
                 out.push_back(c);
