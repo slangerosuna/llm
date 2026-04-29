@@ -236,7 +236,7 @@ def generate_krv_database(sentences, workers=1, devices=None):
 
 def _default_workers():
     if torch.cuda.is_available():
-        return max(1, torch.cuda.device_count())
+        return max(1, 2 * torch.cuda.device_count())
     return 1
 
 
@@ -249,7 +249,18 @@ def _default_devices(workers):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--workers", type=int, default=_default_workers(), help="Parallel worker processes")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Parallel worker processes (0 = auto from --workers-per-gpu)",
+    )
+    parser.add_argument(
+        "--workers-per-gpu",
+        type=int,
+        default=2,
+        help="When CUDA is available and --workers=0, spawn this many workers per GPU",
+    )
     parser.add_argument("--max-lines", type=int, default=max_lines_to_extract, help="Max number of source lines")
     parser.add_argument(
         "--devices",
@@ -259,13 +270,23 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    workers = max(1, args.workers)
+    if args.workers > 0:
+        workers = args.workers
+    else:
+        if torch.cuda.is_available():
+            workers = max(1, torch.cuda.device_count() * max(1, args.workers_per_gpu))
+        else:
+            workers = _default_workers()
+
+    workers = max(1, workers)
     if args.devices.strip():
         devices = [d.strip() for d in args.devices.split(",") if d.strip()]
     else:
         devices = _default_devices(workers)
 
-    if workers > 1 and len(devices) <= 1:
+    if workers > 1 and len(devices) == 1 and devices[0].startswith("cuda"):
+        print(f"Running {workers} worker processes on shared device {devices[0]}.")
+    elif workers > 1 and len(devices) <= 1:
         print("Warning: multiple workers with a single device may not improve speed and can increase memory use.")
 
     sentences = load_sentences(s_database_path, args.max_lines)
