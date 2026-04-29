@@ -25,15 +25,17 @@
 namespace llm::training::looping {
 
 struct SequenceExample {
-    std::string input;
-    std::string target;
+    std::vector<size_t> input;
+    std::vector<size_t> target;
 };
 
 struct SentenceKRVExample {
     std::string sentence;
-    std::vector<float> key_embedding;
-    std::vector<float> relation_embedding;
-    std::vector<float> value_embedding;
+    std::vector<size_t> token_ids;
+
+    std::vector<arch::Scalar> key_embedding;
+    std::vector<arch::Scalar> relation_embedding;
+    std::vector<arch::Scalar> value_embedding;
 };
 
 enum class TrainMode : uint8_t {
@@ -143,7 +145,7 @@ struct TrainConfig {
     // Focusing parameter for FocalLoss (>= 0; 0 == standard CE, 2 is a common default).
     float focal_gamma = 3.0f;
     // Per-class weights for WeightedCrossEntropy / FocalLoss.  Empty == uniform (all 1.0).
-    // Size must equal the vocabulary size (256 for byte-level models).
+    // Size must equal the model vocabulary size.
     std::vector<float> class_weights;
     // Focal-loss class probability cap: p_t = min(sampled_probability, min_p_t).
     // Keep in [0, 1].  Default 1.0 preserves sampled probabilities unchanged.
@@ -377,6 +379,167 @@ class LoopingRetNetSGDTrainer {
         }
     };
 
+    static std::vector<std::string> render_loss_graph(
+        const std::vector<float>& values,
+        size_t x_span,
+        size_t width,
+        size_t height,
+        float y_min,
+        float y_max,
+        const std::string& title)
+    {
+        std::vector<std::string> lines(height, std::string(width, ' '));
+        if (height == 0 || width == 0) {
+            return lines;
+        }
+
+        const size_t title_len = std::min(width, title.size());
+        for (size_t i = 0; i < title_len; ++i) {
+            lines[0][i] = title[i];
+        }
+        if (height == 1) {
+            return lines;
+        }
+
+        const size_t plot_top = 1;
+        const size_t plot_height = height - plot_top;
+        if (plot_height < 2 || width < 3) {
+            return lines;
+        }
+
+        const size_t y_axis_col = 0;
+        const size_t x_axis_row = height - 1;
+        const size_t x_min_col = 1;
+        const size_t x_max_col = width - 1;
+        const size_t y_plot_top = plot_top;
+        const size_t y_plot_bottom = x_axis_row - 1;
+
+        for (size_t r = plot_top; r < height; ++r) {
+            lines[r][y_axis_col] = '|';
+        }
+        for (size_t c = x_min_col; c <= x_max_col; ++c) {
+            lines[x_axis_row][c] = '-';
+        }
+        lines[x_axis_row][y_axis_col] = '+';
+
+        // y-axis fixed labels required by the prompt: [0, 6].
+        if (width >= 4) {
+            lines[y_plot_top][1] = '6';
+            lines[y_plot_bottom][1] = '0';
+        }
+
+        if (width >= 8) {
+            const std::string left = "0%";
+            const std::string right = "100%";
+            for (size_t i = 0; i < left.size() && (1 + i) < width; ++i) {
+                lines[x_axis_row][1 + i] = left[i];
+            }
+            const size_t right_start = (right.size() >= width) ? 0 : (width - right.size());
+            for (size_t i = 0; i < right.size() && (right_start + i) < width; ++i) {
+                lines[x_axis_row][right_start + i] = right[i];
+            }
+        }
+
+        if (values.empty() || y_plot_bottom < y_plot_top) {
+            return lines;
+        }
+
+        const float y_den = std::max(1e-6f, y_max - y_min);
+        const size_t x_den = std::max<size_t>(1, x_span - 1);
+        const size_t y_den_px = std::max<size_t>(1, y_plot_bottom - y_plot_top);
+
+        auto to_point = [&](size_t i, float v) -> std::pair<size_t, size_t> {
+            const size_t x = x_min_col + ((x_max_col - x_min_col) * std::min(i, x_den)) / x_den;
+            const float clamped = std::clamp(v, y_min, y_max);
+            const float yn = (clamped - y_min) / y_den;
+            const size_t y_off = static_cast<size_t>(std::lround((1.0f - yn) * static_cast<float>(y_den_px)));
+            const size_t y = std::min(y_plot_bottom, y_plot_top + y_off);
+            return {x, y};
+        };
+
+        auto draw_point = [&](size_t x, size_t y, char ch) {
+            if (y < height && x < width && y >= plot_top && y <= y_plot_bottom && x >= x_min_col) {
+                lines[y][x] = ch;
+            }
+        };
+
+        auto draw_segment = [&](std::pair<size_t, size_t> a, std::pair<size_t, size_t> b) {
+            const int x0 = static_cast<int>(a.first);
+            const int y0 = static_cast<int>(a.second);
+            const int x1 = static_cast<int>(b.first);
+            const int y1 = static_cast<int>(b.second);
+
+            const int dx = std::abs(x1 - x0);
+            const int sx = (x0 < x1) ? 1 : -1;
+            const int dy = -std::abs(y1 - y0);
+            const int sy = (y0 < y1) ? 1 : -1;
+            int err = dx + dy;
+
+            int x = x0;
+            int y = y0;
+            for (;;) {
+                draw_point(static_cast<size_t>(x), static_cast<size_t>(y), '.');
+                if (x == x1 && y == y1) {
+                    break;
+                }
+                const int e2 = 2 * err;
+                if (e2 >= dy) {
+                    err += dy;
+                    x += sx;
+                }
+                if (e2 <= dx) {
+                    err += dx;
+                    y += sy;
+                }
+            }
+        };
+
+        std::pair<size_t, size_t> prev = to_point(0, values[0]);
+        draw_point(prev.first, prev.second, '*');
+        for (size_t i = 1; i < values.size(); ++i) {
+            const auto cur = to_point(i, values[i]);
+            draw_segment(prev, cur);
+            draw_point(cur.first, cur.second, '*');
+            prev = cur;
+        }
+
+        return lines;
+    }
+
+    static void print_dual_loss_graphs(
+        const std::vector<float>& epoch_losses,
+        size_t epoch_span,
+        const std::vector<float>& batch_losses,
+        size_t batch_span)
+    {
+        constexpr size_t kTotalWidth = 160;
+        constexpr size_t kDelimiterWidth = 2;
+        constexpr size_t kGraphHeight = 35;
+        constexpr size_t kGraphWidth = (kTotalWidth - kDelimiterWidth) / 2; // 79 each
+
+        const auto left = render_loss_graph(
+            epoch_losses,
+            std::max<size_t>(1, epoch_span),
+            kGraphWidth,
+            kGraphHeight,
+            0.0f,
+            6.0f,
+            "Loss by Epoch (0..6)");
+        const auto right = render_loss_graph(
+            batch_losses,
+            std::max<size_t>(1, batch_span),
+            kGraphWidth,
+            kGraphHeight,
+            0.0f,
+            6.0f,
+            "Loss by Batch This Epoch (0..6)");
+
+        std::cout << "\x1b[2J\x1b[H";
+        for (size_t r = 0; r < kGraphHeight; ++r) {
+            std::cout << left[r] << "||" << right[r] << "\n";
+        }
+    }
+
     static std::vector<size_t> stratified_coordinate_indices(
         size_t param_count,
         size_t sample_count,
@@ -474,12 +637,11 @@ class LoopingRetNetSGDTrainer {
         return {ce, grad};
     }
 
-    static float cross_entropy_from_logits(const arch::Vector& logits, uint8_t target) {
+    static float cross_entropy_from_logits(const arch::Vector& logits, size_t target) {
         if (logits.empty()) {
             throw std::runtime_error("LoopingRetNetSGDTrainer: empty logits");
         }
-        const size_t cls = static_cast<size_t>(target);
-        if (cls >= logits.size()) {
+        if (target >= logits.size()) {
             throw std::runtime_error("LoopingRetNetSGDTrainer: target out of range");
         }
 
@@ -506,7 +668,7 @@ class LoopingRetNetSGDTrainer {
             const float shifted = std::clamp(fv - max_logit, -80.0f, 0.0f);
             sum_exp += std::exp(shifted);
         }
-        const float target_logit = static_cast<float>(logits[cls]);
+        const float target_logit = static_cast<float>(logits[target]);
         if (!std::isfinite(target_logit) || !std::isfinite(sum_exp) || sum_exp <= 0.0f) {
             return kNonFinitePenalty;
         }
@@ -579,7 +741,7 @@ class LoopingRetNetSGDTrainer {
 
     static size_t action_supervision_target_from_logits(
         const arch::Vector& current_output_logits,
-        uint8_t target,
+        size_t target,
         bool enable_query,
         size_t decision_index)
     {
@@ -696,7 +858,7 @@ class LoopingRetNetSGDTrainer {
             for (const auto& ex : dataset) {
                 const size_t steps = std::min(ex.input.size(), ex.target.size());
                 for (size_t i = 0; i < steps; ++i) {
-                    const size_t cls = static_cast<size_t>(static_cast<uint8_t>(ex.target[i]));
+                    const size_t cls = ex.target[i];
                     if (cls < output_dim) {
                         ++counts[cls];
                         ++total;
@@ -709,7 +871,7 @@ class LoopingRetNetSGDTrainer {
                 const auto& ex = dataset[idx_dist(rng)];
                 const size_t steps = std::min(ex.input.size(), ex.target.size());
                 for (size_t i = 0; i < steps; ++i) {
-                    const size_t cls = static_cast<size_t>(static_cast<uint8_t>(ex.target[i]));
+                    const size_t cls = ex.target[i];
                     if (cls < output_dim) {
                         ++counts[cls];
                         ++total;
@@ -731,7 +893,7 @@ class LoopingRetNetSGDTrainer {
 
     // Dispatch to the configured output loss type (no gradient).
     float output_loss_from_logits(const arch::Vector& logits, size_t target) const {
-        const float ce = cross_entropy_from_logits(logits, static_cast<uint8_t>(target));
+        const float ce = cross_entropy_from_logits(logits, target);
         switch (cfg_.output_loss_type) {
             case OutputLossType::WeightedCrossEntropy:
                 return class_weight_for(target) * ce;
@@ -855,7 +1017,7 @@ class LoopingRetNetSGDTrainer {
                 &action_control);
             renorm.update(trace);
 
-            loss += output_loss_from_logits(trace.logits, static_cast<size_t>(static_cast<uint8_t>(ex.target[t])));
+            loss += output_loss_from_logits(trace.logits, ex.target[t]);
             if (!std::isfinite(loss)) {
                 return kNonFinitePenalty;
             }
@@ -866,7 +1028,7 @@ class LoopingRetNetSGDTrainer {
                 for (size_t i = 0; i + 1 < trace.per_step_output_logits.size(); ++i) {
                     const size_t target = action_supervision_target_from_logits(
                         trace.per_step_output_logits[i],
-                        static_cast<uint8_t>(ex.target[t]),
+                        ex.target[t],
                         eff_enable_query,
                         i);
                     loss += cfg_.loop_supervision_weight
@@ -886,7 +1048,7 @@ class LoopingRetNetSGDTrainer {
                 for (size_t li = 0; li < load_steps; ++li) {
                     const size_t target_action = action_supervision_target_from_logits(
                         trace.per_step_output_logits[li],
-                        static_cast<uint8_t>(ex.target[t]),
+                        ex.target[t],
                         eff_enable_query,
                         li);
                     const float target_load = (target_action == static_cast<size_t>(llm::arch::ModelAction::QUERY_MEMORY))
@@ -1096,7 +1258,7 @@ public:
             size_t used = 0;
 
             for (const auto& ex : cfg_.sentence_krv_examples) {
-                if (ex.sentence.empty()) {
+                if (ex.token_ids.empty()) {
                     continue;
                 }
 
@@ -1112,7 +1274,7 @@ public:
 
                 arch::LoopingRetNet::StepTrace last_trace{};
                 bool got_generated = false;
-                for (char c : ex.sentence) {
+                for (size_t token_id : ex.token_ids) {
                     arch::ActionControl ctrl;
                     ctrl.enabled = true;
                     ctrl.force_create_memory_first = true;
@@ -1122,7 +1284,7 @@ public:
                     ctrl.create_bias = 3.0f;
 
                     last_trace = model.step_with_trace(
-                        c,
+                        token_id,
                         recurrent_state,
                         chrono_kv_cache,
                         krv_cache,
@@ -1271,6 +1433,8 @@ public:
             double seq_forward_ms = 0.0;
             float gradcheck_rel_err_sum = 0.0f;
             size_t gradcheck_count = 0;
+            std::vector<float> epoch_batch_losses;
+            size_t last_recorded_progress = 0;
 
             // Build and shuffle a per-epoch dataset view. With samples_per_epoch==0,
             // use all examples; otherwise sample with replacement.
@@ -1299,6 +1463,25 @@ public:
                 const double since_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - last_print_time).count();
                 if (since_ms < 100.0) return;
                 last_print_time = now;
+
+                if (ep_done > last_recorded_progress) {
+                    epoch_batch_losses.push_back(cur_loss);
+                    last_recorded_progress = ep_done;
+                }
+
+                std::vector<float> epoch_loss_series;
+                epoch_loss_series.reserve(history.size() + 1);
+                for (const auto& er : history) {
+                    epoch_loss_series.push_back(er.avg_loss);
+                }
+                epoch_loss_series.push_back(cur_loss);
+
+                print_dual_loss_graphs(
+                    epoch_loss_series,
+                    cfg_.epochs,
+                    epoch_batch_losses,
+                    std::max<size_t>(1, ep_total));
+
                 const double elapsed_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - epoch_t0).count();
                 const double elapsed_s = std::max(1e-6, elapsed_ms / 1000.0);
                 const double cur_tok_s = static_cast<double>(epoch_token_count) / elapsed_s;
@@ -1604,7 +1787,7 @@ public:
                                     float out_ce = 0.0f;
                                     arch::Vector d_logits = output_loss_and_grad(
                                         trace.logits,
-                                        static_cast<size_t>(static_cast<uint8_t>(ex.target[t])),
+                                        ex.target[t],
                                         out_ce);
                                     if (!std::isfinite(out_ce)) {
                                         ++local_nonfinite_skips;
@@ -1664,7 +1847,7 @@ public:
                                             const arch::Vector logits = arch::activation::param_tanh(raw, model.output_theta());
                                             return output_loss_from_logits(
                                                 logits,
-                                                static_cast<size_t>(static_cast<uint8_t>(ex.target[t])));
+                                                ex.target[t]);
                                         };
 
                                         const float eps = std::max(1e-5f, cfg_.backprop_fd_check_eps);
@@ -1703,7 +1886,7 @@ public:
                                         for (size_t si = 0; si + 1 < trace.per_step_output_logits.size(); ++si) {
                                             const size_t target_action = action_supervision_target_from_logits(
                                                 trace.per_step_output_logits[si],
-                                                static_cast<uint8_t>(ex.target[t]),
+                                                ex.target[t],
                                                 use_query,
                                                 si);
                                             float action_ce = 0.0f;
@@ -1736,7 +1919,7 @@ public:
                                         for (size_t si = 0; si < trace.per_step_states.size(); ++si) {
                                             const size_t target_action = action_supervision_target_from_logits(
                                                 trace.per_step_output_logits[si],
-                                                static_cast<uint8_t>(ex.target[t]),
+                                                ex.target[t],
                                                 use_query,
                                                 si);
                                             const float target_load =
@@ -2102,7 +2285,7 @@ public:
 
                         struct StepCache {
                             size_t emb_off = 0;
-                            uint8_t target = 0;
+                            size_t target = 0;
                             arch::Vector x;
                             arch::Vector zq, gq, q;
                             arch::Vector zk, gk, k;
@@ -2128,10 +2311,10 @@ public:
                         for (size_t ti = 0; ti < steps; ++ti) {
                             const size_t t = (start + ti) % steps;
                             StepCache sc;
-                            const uint8_t ch = static_cast<uint8_t>(ex.input[t]);
-                            sc.emb_off = static_cast<size_t>(ch) * model_dim;
-                            sc.target = static_cast<uint8_t>(ex.target[t]);
-                            sc.x = embed[static_cast<size_t>(ch)];
+                            const size_t token_id = ex.input[t];
+                            sc.emb_off = token_id * model_dim;
+                            sc.target = ex.target[t];
+                            sc.x = embed[token_id];
 
                             sc.zq = arch::sycl_ops::linear(p_pq.values, qk_dim, model_dim, sc.x, p_bq.values);
                             sc.gq = arch::sycl_ops::linear(p_gq.values, qk_dim, model_dim, sc.x, p_bgq.values);
@@ -2704,17 +2887,17 @@ public:
     }
 };
 
-inline std::vector<SequenceExample> make_shift_dataset(const std::vector<std::string>& texts) {
+inline std::vector<SequenceExample> make_shift_dataset(const std::vector<std::vector<size_t>>& tokenized_texts) {
     std::vector<SequenceExample> dataset;
-    dataset.reserve(texts.size());
+    dataset.reserve(tokenized_texts.size());
 
-    for (const std::string& s : texts) {
-        if (s.size() < 2) {
+    for (const auto& tokens : tokenized_texts) {
+        if (tokens.size() < 2) {
             continue;
         }
         SequenceExample ex;
-        ex.input = s.substr(0, s.size() - 1);
-        ex.target = s.substr(1);
+        ex.input.assign(tokens.begin(), tokens.end() - 1);
+        ex.target.assign(tokens.begin() + 1, tokens.end());
         dataset.push_back(std::move(ex));
     }
 

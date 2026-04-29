@@ -2,12 +2,12 @@
 
 // looping_retnet.hpp
 //
-// LoopingRetNet: character-based language model that combines:
+// LoopingRetNet: token-based language model that combines:
 //   • A RetNet recurrent core (recurrent mode, one step per character).
 //   • An Attention module used *only* to read from long-term graph memory via
 //     AttentionMemory (not for in-sequence context).
 //   • A 4-class action head that chooses on every inner iteration:
-//       0 – OUTPUT:        emit a character and advance to the next input token.
+//       0 – OUTPUT:        emit a token and advance to the next input token.
 //       1 – QUERY_MEMORY:  run a multihop graph query, inject results into the
 //                          retentive KRV cache, and loop again (no output yet).
 //       2 – LOOP:          run the RetNet core again without querying or outputting.
@@ -61,7 +61,7 @@ struct ActionControl {
 
 // this config is for a 1M model
 struct LoopConfig {
-    size_t char_vocab  = 256;  // byte-level vocabulary size
+    size_t char_vocab  = 4096;  // token vocabulary size
     size_t model_dim   = 256;  // embedding / hidden dimension
     size_t qk_dim      = 256;   // query/key dimension for RetNet and Attention
     size_t v_dim       = 256;   // value dimension (== semvec_dim for graph compat)
@@ -98,7 +98,7 @@ struct LinearProj {
 class LoopingRetNet {
     LoopConfig cfg_;
 
-    // Character embedding table: char_vocab × model_dim
+    // Token embedding table: char_vocab × model_dim
     std::vector<Vector> embed_table_;
 
     // Projection into RetNet Q/K/V/R (relation).
@@ -129,7 +129,7 @@ class LoopingRetNet {
     LinearProj memory_entry_head_; // v_dim -> (qk_dim + rel_dim + v_dim)
     LinearProj krv_order_head_;    // v_dim -> 1
 
-    // Character output head.
+    // Token output head.
     LinearProj output_head_; // v_dim → char_vocab
     Scalar output_theta_ = static_cast<Scalar>(1.0f);
 
@@ -141,8 +141,11 @@ class LoopingRetNet {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    const Vector& embed(char c) const {
-        return embed_table_[static_cast<uint8_t>(c)];
+    const Vector& embed(size_t token_id) const {
+        if (token_id >= embed_table_.size()) {
+            throw std::runtime_error("LoopingRetNet: input token id out of range");
+        }
+        return embed_table_[token_id];
     }
 
     ModelAction pick_action(const Vector& state) const {
@@ -161,7 +164,7 @@ class LoopingRetNet {
         return static_cast<ModelAction>(best);
     }
 
-    char pick_char(const Vector& state) const {
+    size_t pick_token(const Vector& state) const {
         const Vector raw = output_head_.forward(state);
         const Vector logits = activation::param_tanh(raw, output_theta_);
         size_t best = 0;
@@ -170,7 +173,7 @@ class LoopingRetNet {
             const float v = static_cast<float>(logits[i]);
             if (v > best_val) { best_val = v; best = i; }
         }
-        return static_cast<char>(best);
+        return best;
     }
 
     Vector output_logits(const Vector& state) const {
@@ -850,12 +853,12 @@ public:
     // ── Per-token step ────────────────────────────────────────────────────────
 
     struct StepOutput {
-        char   output_char;
+        size_t output_token;
         size_t inner_steps_taken;
     };
 
     struct StepTrace {
-        char   output_char;
+        size_t output_token;
         size_t inner_steps_taken;
         size_t query_count;
         size_t generated_memory_count;
@@ -874,7 +877,7 @@ public:
         std::vector<uint8_t> per_step_query_hits;
     };
 
-    // Processes one input character token.
+    // Processes one input token ID.
     //
     // recurrent_state: KVState carrying the RetNet hidden state (read+write).
     // chrono_kv_cache: Chronologically ordered in-sequence KV attention cache;
@@ -886,7 +889,7 @@ public:
     //
     // Returns the emitted character and how many inner steps were consumed.
     StepTrace step_with_trace(
-        char                      input_char,
+        size_t                    input_token,
         KVState&                  recurrent_state,
         AttentionMemory&          chrono_kv_cache,
         AttentionMemory&          krv_cache,
@@ -900,9 +903,9 @@ public:
         bool                      force_query_first = false,
         const ActionControl*      action_control = nullptr)
     {
-        // x starts as the character embedding and may be overridden to the
+        // x starts as the token embedding and may be overridden to the
         // fused-state loop projection on subsequent inner steps.
-        Vector x = embed(input_char);
+        Vector x = embed(input_token);
 
         size_t query_count = 0;
         size_t generated_memory_count = 0;
@@ -1112,7 +1115,7 @@ public:
 
             // action == OUTPUT
             StepTrace trace;
-            trace.output_char = pick_char(state);
+            trace.output_token = pick_token(state);
             trace.inner_steps_taken = step_i + 1;
             trace.query_count = query_count;
             trace.generated_memory_count = generated_memory_count;
@@ -1137,7 +1140,7 @@ public:
     }
 
     StepOutput step(
-        char                      input_char,
+        size_t                    input_token,
         KVState&                  recurrent_state,
         AttentionMemory&          chrono_kv_cache,
         AttentionMemory&          krv_cache,
@@ -1145,7 +1148,7 @@ public:
         memory::MultiHopQuery&    query_engine)
     {
         const StepTrace t = step_with_trace(
-            input_char,
+            input_token,
             recurrent_state,
             chrono_kv_cache,
             krv_cache,
@@ -1158,7 +1161,7 @@ public:
             true,
             false,
             nullptr);
-        return {t.output_char, t.inner_steps_taken};
+        return {t.output_token, t.inner_steps_taken};
     }
 
     size_t output_dim() const {

@@ -28,6 +28,7 @@
 #include <long_term/graph.hpp>
 #include <long_term/memory_module.hpp>
 #include <long_term/spatial_map.hpp>
+#include <tokenizer.hpp>
 #include <training/looping_retnet_training.hpp>
 /*
 namespace beast = boost::beast;
@@ -268,6 +269,7 @@ namespace {
 
 using llm::arch::LoopConfig;
 using llm::arch::LoopingRetNet;
+using llm::arch::Scalar;
 using llm::training::looping::LoopingRetNetSGDTrainer;
 using llm::training::looping::TrainConfig;
 using llm::training::looping::TrainMode;
@@ -614,10 +616,10 @@ std::vector<KRVEmbeddingRecord> load_krv_embedding_database(const std::string& p
   return rows;
 }
 
-std::vector<float> sentence_embedding_hash(const std::string& text, size_t dim) {
-  std::vector<float> out(dim, 0.0f);
+std::vector<Scalar> sentence_embedding_hash(const std::string& text, size_t dim) {
+  std::vector<float> tmp(dim, 0.0f);
   if (dim == 0 || text.empty()) {
-    return out;
+    return std::vector<Scalar>(dim, static_cast<Scalar>(0.0f));
   }
 
   for (size_t i = 0; i < text.size(); ++i) {
@@ -626,26 +628,27 @@ std::vector<float> sentence_embedding_hash(const std::string& text, size_t dim) 
     const uint32_t h2 = (h1 * 16777619u) ^ (c * 1315423911u);
     const size_t idx1 = static_cast<size_t>(h1 % static_cast<uint32_t>(dim));
     const size_t idx2 = static_cast<size_t>(h2 % static_cast<uint32_t>(dim));
-    out[idx1] += 1.0f;
-    out[idx2] -= 0.5f;
+    tmp[idx1] += 1.0f;
+    tmp[idx2] -= 0.5f;
   }
 
   float n2 = 0.0f;
-  for (float v : out) {
+  for (float v : tmp) {
     n2 += v * v;
   }
   const float n = std::sqrt(std::max(1e-12f, n2));
-  for (float& v : out) {
-    v /= n;
+  std::vector<Scalar> out(dim, static_cast<Scalar>(0.0f));
+  for (size_t i = 0; i < dim; ++i) {
+    out[i] = static_cast<Scalar>(tmp[i] / n);
   }
   return out;
 }
 
-std::vector<float> fit_embedding_dim(const std::vector<float>& in, size_t dim) {
-  std::vector<float> out(dim, 0.0f);
+std::vector<Scalar> fit_embedding_dim(const std::vector<float>& in, size_t dim) {
+  std::vector<Scalar> out(dim, static_cast<Scalar>(0.0f));
   const size_t n = std::min(dim, in.size());
   for (size_t i = 0; i < n; ++i) {
-    out[i] = in[i];
+    out[i] = static_cast<Scalar>(in[i]);
   }
   return out;
 }
@@ -670,6 +673,23 @@ std::string get_memory_module_flag(const ParsedArgs& args) {
     return path;
   }
   return get_flag(args, "memory-module", "m");
+}
+
+std::vector<std::vector<size_t>> tokenize_texts(
+    const std::vector<std::string>& texts,
+    const Tokenizer& tokenizer) {
+  std::vector<std::vector<size_t>> out;
+  out.reserve(texts.size());
+  for (const auto& text : texts) {
+    const auto toks = tokenizer.tokenize(text);
+    std::vector<size_t> ids;
+    ids.reserve(toks.size());
+    for (const auto& t : toks) {
+      ids.push_back(t.id);
+    }
+    out.push_back(std::move(ids));
+  }
+  return out;
 }
 
 void write_memory_module_from_dataset(
@@ -760,6 +780,7 @@ void print_usage(const char* program) {
       << "Train required flags:\n"
       << "  -d, --dataset PATH            Plain-text dataset (one sentence per line)\n"
       << "  -o, --output PATH             Output model binary path\n"
+      << "  -tok, --tokenizer PATH        Tokenizer vocab CSV (token,score)\n"
       << "  -m, --memory_module PATH      Save trained memory module graph path\n\n"
       << "Train common optional flags:\n"
       << "  -i, --input PATH              Existing model binary to continue training\n"
@@ -792,9 +813,10 @@ void print_usage(const char* program) {
       << "  --hidden-layers N --max-steps N --decay F --model-seed N --train-seed N\n\n"
       << "Infer flags:\n"
       << "  -i, --input PATH              Model binary\n"
+      << "  -tok, --tokenizer PATH        Tokenizer vocab CSV (token,score)\n"
       << "  -m, --memory_module PATH      Load memory module graph path\n"
       << "  -p, --prompt TEXT             Prompt text (default: empty)\n"
-      << "  -t, --tokens N                Number of generated chars (default: 128)\n"
+      << "  -t, --tokens N                Number of generated tokens (default: 128)\n"
       << "  --enable-query BOOL           Allow QUERY_MEMORY action during inference\n"
       << "  --force-output BOOL           Force OUTPUT action each step\n"
       << "  --use-parallel-retention BOOL Use parallel retention path\n"
@@ -814,6 +836,12 @@ int run_train_command(const ParsedArgs& args) {
   }
 
   const std::string input_path = get_flag(args, "input", "i");
+  const std::string tokenizer_path = get_flag(args, "tokenizer", "tok");
+  if (tokenizer_path.empty()) {
+    throw std::runtime_error("train requires -tok/--tokenizer");
+  }
+  const Tokenizer tokenizer(tokenizer_path);
+
   const std::string memory_module_path = get_memory_module_flag(args);
   const std::string s_database_path = get_flag(args, "s-database", "s");
   const std::string krv_database_path = get_flag(args, "krv-database", "krv");
@@ -822,8 +850,12 @@ int run_train_command(const ParsedArgs& args) {
   }
 
   LoopConfig model_cfg;
+  model_cfg.char_vocab = tokenizer.vocab_size();
   if (has_flag(args, "char-vocab")) {
     model_cfg.char_vocab = parse_size(get_flag(args, "char-vocab"), "char-vocab");
+  }
+  if (model_cfg.char_vocab != tokenizer.vocab_size()) {
+    throw std::runtime_error("--char-vocab must match tokenizer vocab size");
   }
   if (has_flag(args, "model-dim")) {
     model_cfg.model_dim = parse_size(get_flag(args, "model-dim"), "model-dim");
@@ -853,6 +885,9 @@ int run_train_command(const ParsedArgs& args) {
   LoopingRetNet model = input_path.empty()
       ? LoopingRetNet(model_cfg, model_seed)
       : LoopingRetNet::load_from_file(input_path);
+  if (model.config().char_vocab != tokenizer.vocab_size()) {
+    throw std::runtime_error("Model vocabulary size does not match tokenizer vocab size");
+  }
 
   TrainConfig train_cfg;
   train_cfg.memory_cfg.semvec_dim = model.config().v_dim;
@@ -1005,6 +1040,13 @@ int run_train_command(const ParsedArgs& args) {
     for (size_t i = 0; i < sentence_rows.size(); ++i) {
       llm::training::looping::SentenceKRVExample ex;
       ex.sentence = sentence_rows[i].sentence;
+      {
+        const auto toks = tokenizer.tokenize(ex.sentence);
+        ex.token_ids.reserve(toks.size());
+        for (const auto& t : toks) {
+          ex.token_ids.push_back(t.id);
+        }
+      }
       if (!krv_rows.empty()) {
         ex.key_embedding = fit_embedding_dim(krv_rows[i].k, model.config().qk_dim);
         ex.relation_embedding = fit_embedding_dim(krv_rows[i].r, model.config().rel_dim);
@@ -1037,9 +1079,11 @@ int run_train_command(const ParsedArgs& args) {
       group_sentences(raw_lines, group_min, group_max, group_seed);
   std::cout << "After grouping: " << grouped_lines.size() << " samples\n";
 
-  const auto dataset = llm::training::looping::make_shift_dataset(grouped_lines);
+  const auto tokenized_groups = tokenize_texts(grouped_lines, tokenizer);
+
+  const auto dataset = llm::training::looping::make_shift_dataset(tokenized_groups);
   if (dataset.empty()) {
-    throw std::runtime_error("Dataset has no sequences with at least 2 characters");
+    throw std::runtime_error("Dataset has no sequences with at least 2 tokens");
   }
 
   std::cout << "Training examples: " << dataset.size() << "\n";
@@ -1074,6 +1118,11 @@ int run_infer_command(const ParsedArgs& args) {
     throw std::runtime_error("infer requires -i/--input");
   }
   const std::string memory_module_path = get_memory_module_flag(args);
+  const std::string tokenizer_path = get_flag(args, "tokenizer", "tok");
+  if (tokenizer_path.empty()) {
+    throw std::runtime_error("infer requires -tok/--tokenizer");
+  }
+  const Tokenizer tokenizer(tokenizer_path);
   const std::string prompt = get_flag(args, "prompt", "p");
   const size_t tokens = has_flag(args, "tokens", "t")
       ? parse_size(get_flag(args, "tokens", "t"), "tokens")
@@ -1090,6 +1139,9 @@ int run_infer_command(const ParsedArgs& args) {
       : false;
 
   LoopingRetNet model = LoopingRetNet::load_from_file(model_path);
+  if (model.config().char_vocab != tokenizer.vocab_size()) {
+    throw std::runtime_error("Model vocabulary size does not match tokenizer vocab size");
+  }
 
   llm::memory::MemoryConfig mem_cfg;
   mem_cfg.semvec_dim = model.config().v_dim;
@@ -1108,7 +1160,15 @@ int run_infer_command(const ParsedArgs& args) {
   llm::arch::AttentionMemory chrono_kv_cache;
   llm::arch::AttentionMemory krv_cache;
 
-  char current = prompt.empty() ? ' ' : prompt.back();
+  std::vector<size_t> prompt_ids;
+  {
+    const auto prompt_tokens = tokenizer.tokenize(prompt);
+    prompt_ids.reserve(prompt_tokens.size());
+    for (const auto& t : prompt_tokens) {
+      prompt_ids.push_back(t.id);
+    }
+  }
+  size_t current = prompt_ids.empty() ? 0 : prompt_ids.back();
   // BackpropFull trains with a single recurrent step and no KV-cache accumulation
   // (state = ret_norm + v_current).  To match that distribution at inference time we
   // must also use exactly one inner step (forced_loops=1) and suppress KV-cache
@@ -1118,9 +1178,9 @@ int run_infer_command(const ParsedArgs& args) {
   // character (space).
   constexpr size_t kInferForcedLoops    = 1;     // one step = matches BackpropFull
   constexpr bool   kInferWriteMemory    = false; // no KV-cache accumulation
-  for (char c : prompt) {
+  for (size_t token_id : prompt_ids) {
     const auto step = model.step_with_trace(
-        c,
+        token_id,
         recurrent_state,
       chrono_kv_cache,
       krv_cache,
@@ -1132,11 +1192,11 @@ int run_infer_command(const ParsedArgs& args) {
         use_parallel_retention,
         kInferWriteMemory);
     (void)step;
-    current = c;
+    current = token_id;
   }
 
-  std::string generated;
-  generated.reserve(tokens);
+  std::vector<size_t> generated_ids;
+  generated_ids.reserve(tokens);
   for (size_t i = 0; i < tokens; ++i) {
     const auto step = model.step_with_trace(
         current,
@@ -1150,9 +1210,11 @@ int run_infer_command(const ParsedArgs& args) {
         kInferForcedLoops,
         use_parallel_retention,
         kInferWriteMemory);
-    current = step.output_char;
-    generated.push_back(current);
+    current = step.output_token;
+    generated_ids.push_back(current);
   }
+
+  const std::string generated = tokenizer.decode(generated_ids);
 
   std::cout << "Prompt: " << prompt << "\n";
   std::cout << "Completion: " << generated << "\n";
