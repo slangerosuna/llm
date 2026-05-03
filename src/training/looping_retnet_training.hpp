@@ -382,7 +382,7 @@ class LoopingRetNetSGDTrainer {
     };
 
     static std::vector<std::string> render_loss_graph(
-        const std::vector<float>& values,
+        const std::vector<std::pair<size_t, float>>& points,
         size_t x_span,
         size_t width,
         size_t height,
@@ -442,7 +442,7 @@ class LoopingRetNetSGDTrainer {
             }
         }
 
-        if (values.empty() || y_plot_bottom < y_plot_top) {
+        if (points.empty() || y_plot_bottom < y_plot_top) {
             return lines;
         }
 
@@ -496,10 +496,10 @@ class LoopingRetNetSGDTrainer {
             }
         };
 
-        std::pair<size_t, size_t> prev = to_point(0, values[0]);
+        std::pair<size_t, size_t> prev = to_point(points[0].first, points[0].second);
         draw_point(prev.first, prev.second, '*');
-        for (size_t i = 1; i < values.size(); ++i) {
-            const auto cur = to_point(i, values[i]);
+        for (size_t i = 1; i < points.size(); ++i) {
+            const auto cur = to_point(points[i].first, points[i].second);
             draw_segment(prev, cur);
             draw_point(cur.first, cur.second, '*');
             prev = cur;
@@ -509,10 +509,9 @@ class LoopingRetNetSGDTrainer {
     }
 
     static void print_dual_loss_graphs(
-        const std::vector<float>& epoch_losses,
-        size_t epoch_span,
-        const std::vector<float>& batch_losses,
-        size_t batch_span)
+        const std::vector<std::pair<size_t, float>>& krv_losses_by_step,
+        const std::vector<std::pair<size_t, float>>& text_losses_by_step,
+        size_t total_step_span)
     {
         constexpr size_t kTotalWidth = 160;
         constexpr size_t kDelimiterWidth = 2;
@@ -520,21 +519,21 @@ class LoopingRetNetSGDTrainer {
         constexpr size_t kGraphWidth = (kTotalWidth - kDelimiterWidth) / 2; // 79 each
 
         const auto left = render_loss_graph(
-            epoch_losses,
-            std::max<size_t>(1, epoch_span),
+            krv_losses_by_step,
+            std::max<size_t>(1, total_step_span),
             kGraphWidth,
             kGraphHeight,
             0.0f,
             9.0f,
-            "Loss by Epoch (0..9)");
+            "KRV Embedding Loss by Total Step (0..9)");
         const auto right = render_loss_graph(
-            batch_losses,
-            std::max<size_t>(1, batch_span),
+            text_losses_by_step,
+            std::max<size_t>(1, total_step_span),
             kGraphWidth,
             kGraphHeight,
             0.0f,
             9.0f,
-            "Loss by Batch This Epoch (0..9)");
+            "Text Generation Loss by Total Step (0..9)");
 
         // std::cout << "\x1b[2J\x1b[H";
         for (size_t r = 0; r < kGraphHeight; ++r) {
@@ -1438,6 +1437,22 @@ public:
         bool has_ema = false;
         const float ema_beta = std::clamp(cfg_.loss_ema_beta, 0.0f, 0.9999f);
 
+        std::vector<std::pair<size_t, float>> text_losses_by_step;
+        std::vector<std::pair<size_t, float>> krv_losses_by_step;
+        size_t total_loss_steps = 0;
+        auto record_text_loss_step = [&](float loss_value) {
+            if (std::isfinite(loss_value)) {
+                text_losses_by_step.emplace_back(total_loss_steps, loss_value);
+            }
+            ++total_loss_steps;
+        };
+        auto record_krv_loss_step = [&](float loss_value) {
+            if (std::isfinite(loss_value)) {
+                krv_losses_by_step.emplace_back(total_loss_steps, loss_value);
+            }
+            ++total_loss_steps;
+        };
+
         // Phase 3: rolling window of recent losses for adaptive instability detection.
         std::vector<float> recent_losses;
         if (cfg_.adaptive_instability_window > 0) {
@@ -1472,7 +1487,6 @@ public:
             double seq_forward_ms = 0.0;
             float gradcheck_rel_err_sum = 0.0f;
             size_t gradcheck_count = 0;
-            std::vector<float> epoch_batch_losses;
             size_t last_recorded_progress = 0;
 
             // Build and shuffle a per-epoch dataset view. With samples_per_epoch==0,
@@ -1500,7 +1514,7 @@ public:
 
             auto maybe_print = [&](float cur_loss, size_t ep_done, size_t ep_total) {
                 if (ep_done > last_recorded_progress) {
-                    epoch_batch_losses.push_back(cur_loss);
+                    record_text_loss_step(cur_loss);
                     last_recorded_progress = ep_done;
                 }
 
@@ -1509,18 +1523,10 @@ public:
                 if (since_ms < 100.0) return;
                 last_print_time = now;
 
-                std::vector<float> epoch_loss_series;
-                epoch_loss_series.reserve(history.size() + 1);
-                for (const auto& er : history) {
-                    epoch_loss_series.push_back(er.avg_loss);
-                }
-                epoch_loss_series.push_back(cur_loss);
-
                 print_dual_loss_graphs(
-                    epoch_loss_series,
-                    cfg_.epochs,
-                    epoch_batch_losses,
-                    std::max<size_t>(1, ep_total));
+                    krv_losses_by_step,
+                    text_losses_by_step,
+                    std::max<size_t>(1, total_loss_steps));
 
                 const double elapsed_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - epoch_t0).count();
                 const double elapsed_s = std::max(1e-6, elapsed_ms / 1000.0);
@@ -2143,6 +2149,7 @@ public:
                         const auto [krv_batch_loss, krv_used] =
                             run_sentence_krv_alignment_batch(epoch + 1, lr_epoch);
                         if (krv_used > 0 && std::isfinite(krv_batch_loss)) {
+                            record_krv_loss_step(krv_batch_loss);
                             sentence_krv_epoch_loss_acc += krv_batch_loss * static_cast<float>(krv_used);
                             sentence_krv_epoch_used += krv_used;
                         }
@@ -2828,6 +2835,7 @@ public:
                         const auto [krv_batch_loss, krv_used] =
                             run_sentence_krv_alignment_batch(epoch + 1, lr_epoch);
                         if (krv_used > 0 && std::isfinite(krv_batch_loss)) {
+                            record_krv_loss_step(krv_batch_loss);
                             sentence_krv_epoch_loss_acc += krv_batch_loss * static_cast<float>(krv_used);
                             sentence_krv_epoch_used += krv_used;
                         }
@@ -2872,6 +2880,7 @@ public:
                         const auto [krv_batch_loss, krv_used] =
                             run_sentence_krv_alignment_batch(epoch + 1, lr_epoch);
                         if (krv_used > 0 && std::isfinite(krv_batch_loss)) {
+                            record_krv_loss_step(krv_batch_loss);
                             epoch_krv_loss_acc += krv_batch_loss * static_cast<float>(krv_used);
                             epoch_krv_used += krv_used;
                         }
