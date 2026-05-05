@@ -27,7 +27,17 @@ namespace llm::training::looping {
 struct SequenceExample {
     std::vector<size_t> input;
     std::vector<size_t> target;
+    // Optional per-target supervision mask aligned with target indices.
+    // Empty means all target positions are supervised.
+    std::vector<uint8_t> target_mask;
 };
+
+inline bool target_is_supervised(const SequenceExample& ex, size_t target_index) {
+    if (ex.target_mask.empty()) {
+        return true;
+    }
+    return target_index < ex.target_mask.size() && ex.target_mask[target_index] != 0;
+}
 
 struct SentenceKRVExample {
     std::string sentence;
@@ -1830,6 +1840,10 @@ public:
                                     local_query_events += trace.query_count;
                                     ++local_objective_evals;
 
+                                    if (!target_is_supervised(ex, t)) {
+                                        continue;
+                                    }
+
                                     float out_ce = 0.0f;
                                     arch::Vector d_logits = output_loss_and_grad(
                                         trace.logits,
@@ -2342,6 +2356,7 @@ public:
                         struct StepCache {
                             size_t emb_off = 0;
                             size_t target = 0;
+                            bool supervised = true;
                             arch::Vector x;
                             arch::Vector zq, gq, q;
                             arch::Vector zk, gk, k;
@@ -2370,6 +2385,7 @@ public:
                             const size_t token_id = ex.input[t];
                             sc.emb_off = token_id * model_dim;
                             sc.target = ex.target[t];
+                            sc.supervised = target_is_supervised(ex, t);
                             sc.x = embed[token_id];
 
                             sc.zq = arch::sycl_ops::linear(p_pq.values, qk_dim, model_dim, sc.x, p_bq.values);
@@ -2434,18 +2450,20 @@ public:
                                 p_out_w.values, out_dim, v_dim, sc.hstate, p_out_b.values);
                             sc.logits = arch::activation::param_tanh(sc.raw_logits, p_theta.values[0]);
 
-                            float out_ce = 0.0f;
-                            (void)output_loss_and_grad(
-                                sc.logits,
-                                static_cast<size_t>(sc.target),
-                                out_ce);
-                            if (!std::isfinite(out_ce)) {
-                                ++local_nonfinite_skips;
-                                sequence_valid = false;
-                                break;
+                            if (sc.supervised) {
+                                float out_ce = 0.0f;
+                                (void)output_loss_and_grad(
+                                    sc.logits,
+                                    static_cast<size_t>(sc.target),
+                                    out_ce);
+                                if (!std::isfinite(out_ce)) {
+                                    ++local_nonfinite_skips;
+                                    sequence_valid = false;
+                                    break;
+                                }
+                                local_epoch_loss_acc += out_ce;
+                                ++local_objective_evals;
                             }
-                            local_epoch_loss_acc += out_ce;
-                            ++local_objective_evals;
 
                             caches.push_back(std::move(sc));
                         }
@@ -2466,19 +2484,21 @@ public:
                                 // Forward neighbour contribution
                                 if (tr + 1 < caches.size()) {
                                     float cons = 0.0f;
-                                    for (size_t o = 0; o < out_dim; ++o) {
-                                        const float diff = static_cast<float>(caches[tr + 1].raw_logits[o])
-                                            - static_cast<float>(caches[tr].raw_logits[o]);
-                                        cons += diff * diff;
-                                        // d/d_raw[tr] += 2w/D*(raw[tr] - raw[tr+1])
-                                        d_raw_consistency[tr][o] = static_cast<Scalar>(
-                                            static_cast<float>(d_raw_consistency[tr][o]) - w_norm * diff);
-                                        // d/d_raw[tr+1] += 2w/D*(raw[tr+1] - raw[tr])
-                                        d_raw_consistency[tr + 1][o] = static_cast<Scalar>(
-                                            static_cast<float>(d_raw_consistency[tr + 1][o]) + w_norm * diff);
+                                    if (caches[tr].supervised && caches[tr + 1].supervised) {
+                                        for (size_t o = 0; o < out_dim; ++o) {
+                                            const float diff = static_cast<float>(caches[tr + 1].raw_logits[o])
+                                                - static_cast<float>(caches[tr].raw_logits[o]);
+                                            cons += diff * diff;
+                                            // d/d_raw[tr] += 2w/D*(raw[tr] - raw[tr+1])
+                                            d_raw_consistency[tr][o] = static_cast<Scalar>(
+                                                static_cast<float>(d_raw_consistency[tr][o]) - w_norm * diff);
+                                            // d/d_raw[tr+1] += 2w/D*(raw[tr+1] - raw[tr])
+                                            d_raw_consistency[tr + 1][o] = static_cast<Scalar>(
+                                                static_cast<float>(d_raw_consistency[tr + 1][o]) + w_norm * diff);
+                                        }
+                                        local_epoch_loss_acc += cfg_.multistep_consistency_weight
+                                            * cons / static_cast<float>(out_dim);
                                     }
-                                    local_epoch_loss_acc += cfg_.multistep_consistency_weight
-                                        * cons / static_cast<float>(out_dim);
                                 }
                             }
                         }
@@ -2487,15 +2507,23 @@ public:
                         for (size_t tr = caches.size(); tr-- > 0;) {
                             const StepCache& sc = caches[tr];
 
-                            float out_ce = 0.0f;
-                            arch::Vector d_logits = output_loss_and_grad(
-                                sc.logits,
-                                static_cast<size_t>(sc.target),
-                                out_ce);
-                            const auto tanh_grad = arch::activation::dparam_tanh(sc.raw_logits, p_theta.values[0], d_logits);
+                            arch::Vector d_raw_combined(out_dim, static_cast<Scalar>(0.0f));
+                            Scalar dtheta = static_cast<Scalar>(0.0f);
+                            if (sc.supervised) {
+                                float out_ce = 0.0f;
+                                arch::Vector d_logits = output_loss_and_grad(
+                                    sc.logits,
+                                    static_cast<size_t>(sc.target),
+                                    out_ce);
+                                const auto tanh_grad = arch::activation::dparam_tanh(
+                                    sc.raw_logits,
+                                    p_theta.values[0],
+                                    d_logits);
+                                d_raw_combined = std::move(tanh_grad.dx);
+                                dtheta = tanh_grad.dtheta;
+                            }
 
                             // Merge tanh backward with consistency correction.
-                            arch::Vector d_raw_combined = tanh_grad.dx;
                             for (size_t o = 0; o < out_dim && o < d_raw_consistency[tr].size(); ++o) {
                                 d_raw_combined[o] = static_cast<Scalar>(
                                     static_cast<float>(d_raw_combined[o])
@@ -2507,9 +2535,9 @@ public:
                                 p_out_w.values, out_dim, v_dim, sc.hstate, d_raw_combined,
                                 lg_out_w, lg_out_b, d_hstate);
                             lg_theta = static_cast<Scalar>(
-                                static_cast<float>(lg_theta) + static_cast<float>(tanh_grad.dtheta));
+                                static_cast<float>(lg_theta) + static_cast<float>(dtheta));
 
-                            if (cfg_.backprop_include_loop_supervision) {
+                            if (sc.supervised && cfg_.backprop_include_loop_supervision) {
                                 // BackpropFull trains with a forced single-step forward pass
                                 // (equivalent to always choosing OUTPUT on the first inner
                                 // iteration).  Using the sequence-step index 'tr' as
@@ -2670,8 +2698,14 @@ public:
                             }
                         }
 
-                        local_batch_tokens += caches.size();
-                        local_epoch_tokens += caches.size();
+                        size_t supervised_steps = 0;
+                        for (const auto& sc : caches) {
+                            if (sc.supervised) {
+                                ++supervised_steps;
+                            }
+                        }
+                        local_batch_tokens += supervised_steps;
+                        local_epoch_tokens += supervised_steps;
                         ++local_epoch_examples;
                         }
 
@@ -3003,6 +3037,20 @@ inline std::vector<SequenceExample> make_shift_dataset(const std::vector<std::ve
     }
 
     return dataset;
+}
+
+inline std::vector<SequenceExample> make_shift_dataset(const std::vector<std::string>& texts) {
+    std::vector<std::vector<size_t>> tokenized;
+    tokenized.reserve(texts.size());
+    for (const auto& text : texts) {
+        std::vector<size_t> ids;
+        ids.reserve(text.size());
+        for (unsigned char c : text) {
+            ids.push_back(static_cast<size_t>(c));
+        }
+        tokenized.push_back(std::move(ids));
+    }
+    return make_shift_dataset(tokenized);
 }
 
 } // namespace llm::training::looping

@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -350,6 +351,14 @@ std::string to_lower(std::string s) {
   return s;
 }
 
+bool has_lowercase_suffix(const std::string& path, const std::string& suffix) {
+  if (path.size() < suffix.size()) {
+    return false;
+  }
+  const std::string tail = to_lower(path.substr(path.size() - suffix.size()));
+  return tail == to_lower(suffix);
+}
+
 bool parse_bool(const std::string& value) {
   const std::string v = to_lower(value);
   if (v == "1" || v == "true" || v == "yes" || v == "on") {
@@ -479,6 +488,302 @@ std::string get_flag(const ParsedArgs& args, const std::string& long_name, const
 }
 
 std::vector<std::string> parse_csv_row(const std::string& line);
+
+struct JsonConversationExample {
+  std::string input;
+  std::string output;
+};
+
+void append_utf8(uint32_t cp, std::string& out) {
+  if (cp <= 0x7Fu) {
+    out.push_back(static_cast<char>(cp));
+  } else if (cp <= 0x7FFu) {
+    out.push_back(static_cast<char>(0xC0u | ((cp >> 6) & 0x1Fu)));
+    out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  } else if (cp <= 0xFFFFu) {
+    out.push_back(static_cast<char>(0xE0u | ((cp >> 12) & 0x0Fu)));
+    out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+    out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  } else {
+    out.push_back(static_cast<char>(0xF0u | ((cp >> 18) & 0x07u)));
+    out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+    out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+    out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  }
+}
+
+bool is_hex_digit(char c) {
+  return (c >= '0' && c <= '9')
+      || (c >= 'a' && c <= 'f')
+      || (c >= 'A' && c <= 'F');
+}
+
+uint32_t hex_digit_value(char c) {
+  if (c >= '0' && c <= '9') {
+    return static_cast<uint32_t>(c - '0');
+  }
+  if (c >= 'a' && c <= 'f') {
+    return static_cast<uint32_t>(10 + (c - 'a'));
+  }
+  return static_cast<uint32_t>(10 + (c - 'A'));
+}
+
+void skip_json_ws(const std::string& s, size_t& i) {
+  while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i])) != 0) {
+    ++i;
+  }
+}
+
+bool parse_json_string_literal(const std::string& s, size_t& i, std::string& out) {
+  if (i >= s.size() || s[i] != '"') {
+    return false;
+  }
+  ++i;
+  out.clear();
+  while (i < s.size()) {
+    const char c = s[i++];
+    if (c == '"') {
+      return true;
+    }
+    if (c != '\\') {
+      out.push_back(c);
+      continue;
+    }
+    if (i >= s.size()) {
+      return false;
+    }
+    const char esc = s[i++];
+    switch (esc) {
+      case '"': out.push_back('"'); break;
+      case '\\': out.push_back('\\'); break;
+      case '/': out.push_back('/'); break;
+      case 'b': out.push_back('\b'); break;
+      case 'f': out.push_back('\f'); break;
+      case 'n': out.push_back('\n'); break;
+      case 'r': out.push_back('\r'); break;
+      case 't': out.push_back('\t'); break;
+      case 'u': {
+        if (i + 4 > s.size()) {
+          return false;
+        }
+        uint32_t cp = 0;
+        for (size_t k = 0; k < 4; ++k) {
+          if (!is_hex_digit(s[i + k])) {
+            return false;
+          }
+          cp = (cp << 4) | hex_digit_value(s[i + k]);
+        }
+        i += 4;
+        append_utf8(cp, out);
+        break;
+      }
+      default:
+        return false;
+    }
+  }
+  return false;
+}
+
+bool skip_json_value(const std::string& s, size_t& i);
+
+bool skip_json_compound(const std::string& s, size_t& i, char open_ch, char close_ch) {
+  if (i >= s.size() || s[i] != open_ch) {
+    return false;
+  }
+  ++i;
+  while (true) {
+    skip_json_ws(s, i);
+    if (i >= s.size()) {
+      return false;
+    }
+    if (s[i] == close_ch) {
+      ++i;
+      return true;
+    }
+    if (!skip_json_value(s, i)) {
+      return false;
+    }
+    skip_json_ws(s, i);
+    if (i >= s.size()) {
+      return false;
+    }
+    if (s[i] == ',') {
+      ++i;
+      continue;
+    }
+    if (s[i] == close_ch) {
+      ++i;
+      return true;
+    }
+    return false;
+  }
+}
+
+bool skip_json_object(const std::string& s, size_t& i) {
+  if (i >= s.size() || s[i] != '{') {
+    return false;
+  }
+  ++i;
+  while (true) {
+    skip_json_ws(s, i);
+    if (i >= s.size()) {
+      return false;
+    }
+    if (s[i] == '}') {
+      ++i;
+      return true;
+    }
+    std::string key;
+    if (!parse_json_string_literal(s, i, key)) {
+      return false;
+    }
+    skip_json_ws(s, i);
+    if (i >= s.size() || s[i] != ':') {
+      return false;
+    }
+    ++i;
+    skip_json_ws(s, i);
+    if (!skip_json_value(s, i)) {
+      return false;
+    }
+    skip_json_ws(s, i);
+    if (i >= s.size()) {
+      return false;
+    }
+    if (s[i] == ',') {
+      ++i;
+      continue;
+    }
+    if (s[i] == '}') {
+      ++i;
+      return true;
+    }
+    return false;
+  }
+}
+
+bool skip_json_value(const std::string& s, size_t& i) {
+  if (i >= s.size()) {
+    return false;
+  }
+  if (s[i] == '"') {
+    std::string tmp;
+    return parse_json_string_literal(s, i, tmp);
+  }
+  if (s[i] == '{') {
+    return skip_json_object(s, i);
+  }
+  if (s[i] == '[') {
+    return skip_json_compound(s, i, '[', ']');
+  }
+  size_t start = i;
+  while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']' && std::isspace(static_cast<unsigned char>(s[i])) == 0) {
+    ++i;
+  }
+  return i > start;
+}
+
+bool extract_top_level_json_string_field(
+    const std::string& line,
+    const std::string& field,
+    std::string& value) {
+  size_t i = 0;
+  skip_json_ws(line, i);
+  if (i >= line.size() || line[i] != '{') {
+    return false;
+  }
+  ++i;
+  while (true) {
+    skip_json_ws(line, i);
+    if (i >= line.size()) {
+      return false;
+    }
+    if (line[i] == '}') {
+      return false;
+    }
+
+    std::string key;
+    if (!parse_json_string_literal(line, i, key)) {
+      return false;
+    }
+
+    skip_json_ws(line, i);
+    if (i >= line.size() || line[i] != ':') {
+      return false;
+    }
+    ++i;
+    skip_json_ws(line, i);
+
+    if (key == field) {
+      return parse_json_string_literal(line, i, value);
+    }
+
+    if (!skip_json_value(line, i)) {
+      return false;
+    }
+
+    skip_json_ws(line, i);
+    if (i >= line.size()) {
+      return false;
+    }
+    if (line[i] == ',') {
+      ++i;
+      continue;
+    }
+    if (line[i] == '}') {
+      return false;
+    }
+    return false;
+  }
+}
+
+std::vector<JsonConversationExample> load_dataset_jsonl_examples(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) {
+    throw std::runtime_error("Failed to open dataset file: " + path);
+  }
+
+  ProgressBar progress("Loading dataset JSONL", safe_file_size(path));
+  uintmax_t fallback_bytes = 0;
+  std::vector<JsonConversationExample> rows;
+
+  std::string line;
+  while (std::getline(in, line)) {
+    fallback_bytes += static_cast<uintmax_t>(line.size() + 1);
+    const std::streampos pos = in.tellg();
+    if (pos >= 0) {
+      progress.update(static_cast<uintmax_t>(pos));
+    } else {
+      progress.update(fallback_bytes);
+    }
+
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (line.empty()) {
+      continue;
+    }
+
+    JsonConversationExample ex;
+    if (!extract_top_level_json_string_field(line, "input", ex.input)) {
+      continue;
+    }
+    if (!extract_top_level_json_string_field(line, "output", ex.output)) {
+      continue;
+    }
+
+    if (!ex.input.empty() && !ex.output.empty()) {
+      rows.push_back(std::move(ex));
+    }
+  }
+
+  progress.finish();
+
+  if (rows.empty()) {
+    throw std::runtime_error("Dataset JSONL has no valid rows with string fields input/output: " + path);
+  }
+  return rows;
+}
 
 std::vector<std::string> load_dataset_lines(const std::string& path) {
   std::ifstream in(path);
@@ -799,6 +1104,111 @@ std::string get_memory_module_flag(const ParsedArgs& args) {
   return get_flag(args, "memory-module", "m");
 }
 
+std::string build_chat_training_text(const std::string& input, const std::string& output) {
+  return std::string("<user>\n")
+      + to_lower(input)
+      + "\n</user>\n<assistant>\n"
+      + to_lower(output)
+      + "\n</assistant>";
+}
+
+std::vector<size_t> tokenize_ids(const std::string& text, const Tokenizer& tokenizer) {
+  const auto toks = tokenizer.tokenize(text, TokenizationMode::Training);
+  std::vector<size_t> ids;
+  ids.reserve(toks.size());
+  for (const auto& t : toks) {
+    ids.push_back(t.id);
+  }
+  return ids;
+}
+
+size_t find_subsequence(
+    const std::vector<size_t>& haystack,
+    const std::vector<size_t>& needle,
+    size_t start) {
+  if (needle.empty() || haystack.size() < needle.size() || start > haystack.size() - needle.size()) {
+    return std::string::npos;
+  }
+  for (size_t i = start; i + needle.size() <= haystack.size(); ++i) {
+    bool match = true;
+    for (size_t j = 0; j < needle.size(); ++j) {
+      if (haystack[i + j] != needle[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      return i;
+    }
+  }
+  return std::string::npos;
+}
+
+llm::training::looping::SequenceExample make_shift_example(
+    const std::vector<size_t>& tokens,
+    const std::vector<uint8_t>& target_mask = {}) {
+  llm::training::looping::SequenceExample ex;
+  if (tokens.size() < 2) {
+    return ex;
+  }
+  ex.input.assign(tokens.begin(), tokens.end() - 1);
+  ex.target.assign(tokens.begin() + 1, tokens.end());
+  if (!target_mask.empty()) {
+    ex.target_mask = target_mask;
+  }
+  return ex;
+}
+
+llm::training::looping::SequenceExample make_jsonl_chat_example(
+    const std::string& input,
+    const std::string& output,
+    const Tokenizer& tokenizer,
+    const std::vector<size_t>& assistant_open_ids,
+    const std::vector<size_t>& assistant_close_ids) {
+  const std::string text = build_chat_training_text(input, output);
+  const std::vector<size_t> tokens = tokenize_ids(text, tokenizer);
+  if (tokens.size() < 2) {
+    return {};
+  }
+
+  const size_t open_pos = find_subsequence(tokens, assistant_open_ids, 0);
+  if (open_pos == std::string::npos) {
+    throw std::runtime_error("Tokenizer could not locate <assistant> token span in JSONL sample");
+  }
+  const size_t close_pos = find_subsequence(tokens, assistant_close_ids, open_pos + assistant_open_ids.size());
+  if (close_pos == std::string::npos) {
+    throw std::runtime_error("Tokenizer could not locate </assistant> token span in JSONL sample");
+  }
+
+  const size_t content_begin = open_pos + assistant_open_ids.size();
+  const size_t content_end = close_pos;
+
+  std::vector<uint8_t> mask(tokens.size() - 1, static_cast<uint8_t>(0));
+  for (size_t i = 0; i < mask.size(); ++i) {
+    const size_t target_token_pos = i + 1;
+    if (target_token_pos >= content_begin && target_token_pos < content_end) {
+      mask[i] = static_cast<uint8_t>(1);
+    }
+  }
+
+  return make_shift_example(tokens, mask);
+}
+
+bool has_supervised_targets(const llm::training::looping::SequenceExample& ex) {
+  if (ex.input.empty() || ex.target.empty()) {
+    return false;
+  }
+  if (ex.target_mask.empty()) {
+    return true;
+  }
+  for (uint8_t v : ex.target_mask) {
+    if (v != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<std::vector<size_t>> tokenize_texts(
     const std::vector<std::string>& texts,
     const Tokenizer& tokenizer) {
@@ -807,13 +1217,7 @@ std::vector<std::vector<size_t>> tokenize_texts(
   ProgressBar progress("Tokenizing dataset", texts.size());
   for (size_t i = 0; i < texts.size(); ++i) {
     const auto& text = texts[i];
-    const auto toks = tokenizer.tokenize(text, TokenizationMode::Training);
-    std::vector<size_t> ids;
-    ids.reserve(toks.size());
-    for (const auto& t : toks) {
-      ids.push_back(t.id);
-    }
-    out.push_back(std::move(ids));
+    out.push_back(tokenize_ids(text, tokenizer));
     progress.update(i + 1);
   }
   progress.finish();
@@ -877,7 +1281,7 @@ void print_usage(const char* program) {
       << "  " << program << " train -d DATASET -o OUTPUT [options]\n"
       << "  " << program << " infer -i MODEL [options]\n\n"
       << "Train required flags:\n"
-      << "  -d, --dataset PATH            CSV dataset with columns: doc_id,sent_id,text\n"
+      << "  -d, --dataset PATH            CSV (doc_id,sent_id,text) or JSONL (input,output) dataset\n"
       << "  -o, --output PATH             Output model binary path\n"
       << "  -tok, --tokenizer PATH        Tokenizer vocab CSV (token,score)\n"
       << "  -m, --memory_module PATH      Save trained memory module graph path\n\n"
@@ -1159,12 +1563,68 @@ int run_train_command(const ParsedArgs& args) {
               << train_cfg.sentence_krv_examples.size() << "\n";
   }
 
+  std::vector<llm::training::looping::SequenceExample> dataset;
+  if (has_lowercase_suffix(dataset_path, ".jsonl")) {
+    const std::vector<JsonConversationExample> rows = load_dataset_jsonl_examples(dataset_path);
+    std::cout << "Loaded dataset rows: " << rows.size() << "\n";
+
+    const std::vector<size_t> assistant_open_ids = tokenize_ids("<assistant>", tokenizer);
+    const std::vector<size_t> assistant_close_ids = tokenize_ids("</assistant>", tokenizer);
+    if (assistant_open_ids.empty() || assistant_close_ids.empty()) {
+      throw std::runtime_error("Tokenizer could not tokenize <assistant></assistant> tags");
+    }
+
+    dataset.reserve(rows.size());
+
+    const size_t warm_chunk_size = std::max<size_t>(train_cfg.batch_size, 32);
+    std::vector<llm::training::looping::SequenceExample> warm_chunk;
+    warm_chunk.reserve(warm_chunk_size);
+
+    TrainConfig warm_cfg = train_cfg;
+    warm_cfg.epochs = 1;
+    LoopingRetNetSGDTrainer warm_trainer(warm_cfg);
+
+    ProgressBar progress("Tokenizing/training JSONL", rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const auto ex = make_jsonl_chat_example(
+          rows[i].input,
+          rows[i].output,
+          tokenizer,
+          assistant_open_ids,
+          assistant_close_ids);
+      if (!has_supervised_targets(ex)) {
+        progress.update(i + 1);
+        continue;
+      }
+
+      dataset.push_back(ex);
+      warm_chunk.push_back(ex);
+
+      if (warm_chunk.size() >= warm_chunk_size) {
+        const auto warm_history = warm_trainer.train(model, warm_chunk);
+        if (warm_history.empty()) {
+          throw std::runtime_error("Streaming warm-start training produced empty history");
+        }
+        warm_chunk.clear();
+      }
+
+      progress.update(i + 1);
+    }
+    progress.finish();
+
+    if (!warm_chunk.empty()) {
+      const auto warm_history = warm_trainer.train(model, warm_chunk);
+      if (warm_history.empty()) {
+        throw std::runtime_error("Streaming warm-start training produced empty history");
+      }
+    }
+  } else {
     const std::vector<std::string> dataset_texts = load_dataset_lines(dataset_path);
     std::cout << "Loaded dataset rows: " << dataset_texts.size() << "\n";
-
     const auto tokenized_groups = tokenize_texts(dataset_texts, tokenizer);
+    dataset = llm::training::looping::make_shift_dataset(tokenized_groups);
+  }
 
-  const auto dataset = llm::training::looping::make_shift_dataset(tokenized_groups);
   if (dataset.empty()) {
     throw std::runtime_error("Dataset has no sequences with at least 2 tokens");
   }
