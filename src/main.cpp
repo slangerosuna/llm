@@ -1576,13 +1576,13 @@ int run_train_command(const ParsedArgs& args) {
 
     dataset.reserve(rows.size());
 
-    const size_t warm_chunk_size = std::max<size_t>(train_cfg.batch_size, 32);
-    std::vector<llm::training::looping::SequenceExample> warm_chunk;
-    warm_chunk.reserve(warm_chunk_size);
+    //const size_t warm_chunk_size = std::max<size_t>(train_cfg.batch_size, 32);
+    //std::vector<llm::training::looping::SequenceExample> warm_chunk;
+    //warm_chunk.reserve(warm_chunk_size);
 
-    TrainConfig warm_cfg = train_cfg;
-    warm_cfg.epochs = 1;
-    LoopingRetNetSGDTrainer warm_trainer(warm_cfg);
+    //TrainConfig warm_cfg = train_cfg;
+    //warm_cfg.epochs = 1;
+    //LoopingRetNetSGDTrainer warm_trainer(warm_cfg);
 
     ProgressBar progress("Tokenizing/training JSONL", rows.size());
     for (size_t i = 0; i < rows.size(); ++i) {
@@ -1598,25 +1598,25 @@ int run_train_command(const ParsedArgs& args) {
       }
 
       dataset.push_back(ex);
-      warm_chunk.push_back(ex);
+      //warm_chunk.push_back(ex);
 
-      if (warm_chunk.size() >= warm_chunk_size) {
+      /* if (warm_chunk.size() >= warm_chunk_size) {
         const auto warm_history = warm_trainer.train(model, warm_chunk);
         if (warm_history.empty()) {
           throw std::runtime_error("Streaming warm-start training produced empty history");
         }
         warm_chunk.clear();
-      }
+      } */
 
       progress.update(i + 1);
     }
     progress.finish();
 
     if (!warm_chunk.empty()) {
-      const auto warm_history = warm_trainer.train(model, warm_chunk);
+      /* const auto warm_history = warm_trainer.train(model, warm_chunk);
       if (warm_history.empty()) {
         throw std::runtime_error("Streaming warm-start training produced empty history");
-      }
+      } */
     }
   } else {
     const std::vector<std::string> dataset_texts = load_dataset_lines(dataset_path);
