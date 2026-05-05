@@ -1612,12 +1612,12 @@ int run_train_command(const ParsedArgs& args) {
     }
     progress.finish();
 
-    if (!warm_chunk.empty()) {
-      /* const auto warm_history = warm_trainer.train(model, warm_chunk);
+    /*if (!warm_chunk.empty()) {
+      const auto warm_history = warm_trainer.train(model, warm_chunk);
       if (warm_history.empty()) {
         throw std::runtime_error("Streaming warm-start training produced empty history");
-      } */
-    }
+      }
+    }*/
   } else {
     const std::vector<std::string> dataset_texts = load_dataset_lines(dataset_path);
     std::cout << "Loaded dataset rows: " << dataset_texts.size() << "\n";
