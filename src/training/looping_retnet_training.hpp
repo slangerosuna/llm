@@ -1522,7 +1522,7 @@ public:
                 ? "FD"
                 : (cfg_.mode == TrainMode::BackpropHeads ? "BP_HEADS" : "BP_FULL");
 
-            auto maybe_print = [&](float cur_loss, size_t ep_done, size_t ep_total) {
+            auto maybe_print = [&](float cur_loss, size_t ep_done, size_t ep_total, bool force = false) {
                 if (ep_done > last_recorded_progress) {
                     record_text_loss_step(cur_loss);
                     last_recorded_progress = ep_done;
@@ -1530,7 +1530,7 @@ public:
 
                 const auto now = std::chrono::steady_clock::now();
                 const double since_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - last_print_time).count();
-                if (since_ms < 100.0) return;
+                if (!force && since_ms < 100.0) return;
                 last_print_time = now;
 
                 print_dual_loss_graphs(
@@ -3015,7 +3015,11 @@ public:
             }
             inter_loss_delta = loss_delta;
             inter_unstable = unstable_epoch;
-            maybe_print(epoch_loss, epoch_dataset.size() / cfg_.batch_size, epoch_dataset.size() / cfg_.batch_size);
+            maybe_print(
+                epoch_loss,
+                epoch_dataset.size() / cfg_.batch_size,
+                epoch_dataset.size() / cfg_.batch_size,
+                true);
         }
 
         return history;
