@@ -1,0 +1,14 @@
+.git
+.gitignore
+build
+build-asan
+build-container
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.pyc
+__pycache__/
+.vscode/
