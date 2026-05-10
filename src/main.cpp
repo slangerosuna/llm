@@ -1096,6 +1096,24 @@ std::string strip_spaces_before_punct(const std::string& s) {
   return out;
 }
 
+std::string replace_whitespace_marker_with_spaces(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    if (c == 0xE2u
+        && i + 2 < s.size()
+        && static_cast<unsigned char>(s[i + 1]) == 0x96u
+        && static_cast<unsigned char>(s[i + 2]) == 0x81u) {
+      out.push_back(' ');
+      i += 2;
+      continue;
+    }
+    out.push_back(s[i]);
+  }
+  return out;
+}
+
 std::string get_memory_module_flag(const ParsedArgs& args) {
   std::string path = get_flag(args, "memory_module", "m");
   if (!path.empty()) {
@@ -1928,7 +1946,7 @@ int run_infer_command(const ParsedArgs& args) {
     generated_ids.push_back(current);
   }
 
-  const std::string generated = tokenizer.decode(generated_ids);
+  const std::string generated = replace_whitespace_marker_with_spaces(tokenizer.decode(generated_ids));
 
   std::cout << "Prompt: " << prompt << "\n";
   std::cout << "Completion: " << generated << "\n";
@@ -2143,7 +2161,8 @@ int run_chat_command(const ParsedArgs& args) {
 
     const std::string generated_raw = tokenizer.decode(generated_ids);
     const ChatTextState final_state = parse_chat_text_state(generated_raw);
-    const std::string cleaned = strip_spaces_before_punct(final_state.visible_text);
+    const std::string cleaned = strip_spaces_before_punct(
+      replace_whitespace_marker_with_spaces(final_state.visible_text));
     std::cout << "Assistant: " << cleaned << "\n";
   };
 
