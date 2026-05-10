@@ -1112,6 +1112,82 @@ std::string build_chat_training_text(const std::string& input, const std::string
       + "\n</assistant>";
 }
 
+std::string build_chat_prompt_text(const std::string& input) {
+  return std::string("<user>\n")
+      + to_lower(input)
+      + "\n</user>\n<assistant>\n";
+}
+
+size_t find_next_sequence_token(
+    const std::vector<size_t>& history,
+    const std::vector<size_t>& sequence) {
+  if (sequence.empty()) {
+    return std::string::npos;
+  }
+  if (sequence.size() == 1) {
+    return sequence[0];
+  }
+
+  const size_t max_prefix = std::min(history.size(), sequence.size() - 1);
+  for (size_t prefix = max_prefix; prefix > 0; --prefix) {
+    bool match = true;
+    for (size_t i = 0; i < prefix; ++i) {
+      if (history[history.size() - prefix + i] != sequence[i]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      return sequence[prefix];
+    }
+  }
+
+  return sequence[0];
+}
+
+struct ChatTextState {
+  bool in_think = false;
+  bool assistant_closed = false;
+  std::string visible_text;
+};
+
+ChatTextState parse_chat_text_state(const std::string& raw) {
+  static const std::string kAssistantOpen = "<assistant>";
+  static const std::string kAssistantClose = "</assistant>";
+  static const std::string kThinkOpen = "<think>";
+  static const std::string kThinkClose = "</think>";
+
+  ChatTextState out;
+  size_t i = 0;
+  while (i < raw.size()) {
+    if (raw.compare(i, kAssistantClose.size(), kAssistantClose) == 0) {
+      out.assistant_closed = true;
+      break;
+    }
+    if (raw.compare(i, kAssistantOpen.size(), kAssistantOpen) == 0) {
+      i += kAssistantOpen.size();
+      continue;
+    }
+    if (raw.compare(i, kThinkOpen.size(), kThinkOpen) == 0) {
+      out.in_think = true;
+      i += kThinkOpen.size();
+      continue;
+    }
+    if (raw.compare(i, kThinkClose.size(), kThinkClose) == 0) {
+      out.in_think = false;
+      i += kThinkClose.size();
+      continue;
+    }
+
+    if (!out.in_think) {
+      out.visible_text.push_back(raw[i]);
+    }
+    ++i;
+  }
+
+  return out;
+}
+
 std::vector<size_t> tokenize_ids(const std::string& text, const Tokenizer& tokenizer) {
   const auto toks = tokenizer.tokenize(text, TokenizationMode::Training);
   std::vector<size_t> ids;
@@ -1279,7 +1355,8 @@ void print_usage(const char* program) {
       << "Usage:\n"
       << "  " << program << " server\n"
       << "  " << program << " train -d DATASET -o OUTPUT [options]\n"
-      << "  " << program << " infer -i MODEL [options]\n\n"
+  << "  " << program << " infer -i MODEL [options]\n"
+  << "  " << program << " chat -i MODEL [options]\n\n"
       << "Train required flags:\n"
       << "  -d, --dataset PATH            CSV (doc_id,sent_id,text) or JSONL (input,output) dataset\n"
       << "  -o, --output PATH             Output model binary path\n"
@@ -1322,6 +1399,20 @@ void print_usage(const char* program) {
       << "  --use-parallel-retention BOOL Use parallel retention path\n"
       << "  --bias-against-whitespace F   Logit penalty subtracted from whitespace tokens (default: 0)\n"
       << "  --temperature F               Sampling temperature; 0 = argmax (default: 0.7)\n"
+      << "\n"
+      << "Chat flags:\n"
+      << "  -i, --input PATH              Model binary\n"
+      << "  -tok, --tokenizer PATH        Tokenizer vocab CSV (token,score)\n"
+      << "  -m, --memory_module PATH      Load memory module graph path\n"
+      << "  -p, --prompt TEXT             User prompt text (default: empty)\n"
+      << "  -t, --tokens N                Maximum generated tokens (default: 256)\n"
+      << "  --enable-query BOOL           Allow QUERY_MEMORY action during inference\n"
+      << "  --force-output BOOL           Force OUTPUT action each step\n"
+      << "  --use-parallel-retention BOOL Use parallel retention path\n"
+      << "  --bias-against-whitespace F   Logit penalty subtracted from whitespace tokens (default: 0)\n"
+      << "  --temperature F               Sampling temperature; 0 = argmax (default: 0.7)\n"
+      << "  --assistant-close-bias-max F  Max positive bias for </assistant> sequence (default: 8.0)\n"
+      << "  --think-close-bias F          Extra positive bias for </think> while inside <think> (default: 6.0)\n"
       << "\n"
       << "Example:\n"
       << "  " << program << " train -i model.bin -o trained.bin -d dataset.txt --epochs 4096 --mode BackpropFull\n";
@@ -1844,6 +1935,224 @@ int run_infer_command(const ParsedArgs& args) {
   return 0;
 }
 
+int run_chat_command(const ParsedArgs& args) {
+  const std::string model_path = get_flag(args, "input", "i");
+  if (model_path.empty()) {
+    throw std::runtime_error("chat requires -i/--input");
+  }
+  const std::string memory_module_path = get_memory_module_flag(args);
+  const std::string tokenizer_path = get_flag(args, "tokenizer", "tok");
+  if (tokenizer_path.empty()) {
+    throw std::runtime_error("chat requires -tok/--tokenizer");
+  }
+  const Tokenizer tokenizer(tokenizer_path);
+  const std::string prompt = get_flag(args, "prompt", "p");
+  const size_t tokens = has_flag(args, "tokens", "t")
+      ? parse_size(get_flag(args, "tokens", "t"), "tokens")
+      : 256;
+
+  const bool enable_query = has_flag(args, "enable-query")
+      ? parse_bool(get_flag(args, "enable-query"))
+      : true;
+  const bool force_output = has_flag(args, "force-output")
+      ? parse_bool(get_flag(args, "force-output"))
+      : false;
+  const bool use_parallel_retention = has_flag(args, "use-parallel-retention")
+      ? parse_bool(get_flag(args, "use-parallel-retention"))
+      : false;
+  const float whitespace_bias = has_flag(args, "bias-against-whitespace")
+      ? (get_flag(args, "bias-against-whitespace") == "true"
+             ? 10.0f
+             : parse_float(get_flag(args, "bias-against-whitespace"), "bias-against-whitespace"))
+      : 0.0f;
+  const float temperature = has_flag(args, "temperature")
+      ? parse_float(get_flag(args, "temperature"), "temperature")
+      : 0.7f;
+  const float assistant_close_bias_max = has_flag(args, "assistant-close-bias-max")
+      ? parse_float(get_flag(args, "assistant-close-bias-max"), "assistant-close-bias-max")
+      : 8.0f;
+  const float think_close_bias = has_flag(args, "think-close-bias")
+      ? parse_float(get_flag(args, "think-close-bias"), "think-close-bias")
+      : 6.0f;
+
+  LoopingRetNet model = LoopingRetNet::load_from_file(model_path);
+  if (model.config().char_vocab != tokenizer.vocab_size()) {
+    throw std::runtime_error("Model vocabulary size does not match tokenizer vocab size");
+  }
+
+  llm::memory::MemoryConfig mem_cfg;
+  mem_cfg.semvec_dim = model.config().v_dim;
+  Graph graph;
+  SpatialMap spatial_map;
+  llm::memory::NodeCompressor compressor(model.config().v_dim, mem_cfg.semvec_dim);
+  llm::memory::GraphMemoryBridge bridge(graph, spatial_map, std::move(compressor), mem_cfg);
+  llm::memory::MultiHopQuery query(graph, spatial_map, mem_cfg);
+
+  if (!memory_module_path.empty()) {
+    graph.load_from_file(memory_module_path, spatial_map);
+    std::cout << "Loaded memory module from: " << memory_module_path << "\n";
+  }
+
+  std::vector<bool> is_whitespace_token(tokenizer.vocab_size(), false);
+  if (whitespace_bias != 0.0f) {
+    for (size_t id = 0; id < tokenizer.vocab_size(); ++id) {
+      const std::string raw = tokenizer.token_text(id);
+      if (raw.empty()) { continue; }
+      bool all_ws = true;
+      size_t ci = 0;
+      while (ci < raw.size()) {
+        const unsigned char c = static_cast<unsigned char>(raw[ci]);
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+          ++ci;
+        } else if (c == 0xe2u
+                   && ci + 2 < raw.size()
+                   && static_cast<unsigned char>(raw[ci + 1]) == 0x96u
+                   && static_cast<unsigned char>(raw[ci + 2]) == 0x81u) {
+          ci += 3;
+        } else {
+          all_ws = false;
+          break;
+        }
+      }
+      is_whitespace_token[id] = all_ws;
+    }
+  }
+
+  const std::vector<size_t> assistant_close_ids = tokenize_ids("</assistant>", tokenizer);
+  if (assistant_close_ids.empty()) {
+    throw std::runtime_error("Tokenizer could not tokenize </assistant>");
+  }
+  const std::vector<size_t> think_close_ids = tokenize_ids("</think>", tokenizer);
+
+  std::mt19937 rng(std::random_device{}());
+  const auto sample_with_bias = [&](const llm::arch::Vector& logits,
+                                    const std::vector<size_t>& generated,
+                                    bool in_think,
+                                    float assistant_progress_bias) -> size_t {
+    if (logits.empty()) { return 0; }
+    const size_t n = std::min(logits.size(), is_whitespace_token.size());
+    std::vector<float> scores(n);
+    for (size_t i = 0; i < n; ++i) {
+      scores[i] = static_cast<float>(logits[i])
+          - (whitespace_bias != 0.0f && is_whitespace_token[i] ? whitespace_bias : 0.0f);
+    }
+
+    const size_t next_assistant_close = find_next_sequence_token(generated, assistant_close_ids);
+    if (next_assistant_close != std::string::npos && next_assistant_close < n) {
+      scores[next_assistant_close] += assistant_progress_bias;
+    }
+
+    if (in_think && !think_close_ids.empty()) {
+      const size_t next_think_close = find_next_sequence_token(generated, think_close_ids);
+      if (next_think_close != std::string::npos && next_think_close < n) {
+        scores[next_think_close] += think_close_bias;
+      }
+    }
+
+    if (temperature <= 0.0f) {
+      size_t best = 0;
+      for (size_t i = 1; i < n; ++i) {
+        if (scores[i] > scores[best]) { best = i; }
+      }
+      return best;
+    }
+
+    float max_s = scores[0];
+    for (size_t i = 1; i < n; ++i) {
+      max_s = std::max(max_s, scores[i]);
+    }
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+      scores[i] = std::exp((scores[i] - max_s) / temperature);
+      sum += scores[i];
+    }
+    std::uniform_real_distribution<float> dist(0.0f, sum);
+    float r = dist(rng);
+    for (size_t i = 0; i < n; ++i) {
+      r -= scores[i];
+      if (r <= 0.0f) {
+        return i;
+      }
+    }
+    return n - 1;
+  };
+
+  llm::arch::KVState recurrent_state;
+  llm::arch::AttentionMemory chrono_kv_cache;
+  llm::arch::AttentionMemory krv_cache;
+
+  const std::string formatted_prompt = build_chat_prompt_text(prompt);
+  std::vector<size_t> prompt_ids;
+  {
+    const auto prompt_tokens = tokenizer.tokenize(formatted_prompt);
+    prompt_ids.reserve(prompt_tokens.size());
+    for (const auto& t : prompt_tokens) {
+      prompt_ids.push_back(t.id);
+    }
+  }
+
+  size_t current = prompt_ids.empty() ? 0 : prompt_ids.back();
+  constexpr size_t kInferForcedLoops = 1;
+  constexpr bool kInferWriteMemory = false;
+  for (size_t token_id : prompt_ids) {
+    const auto step = model.step_with_trace(
+        token_id,
+        recurrent_state,
+        chrono_kv_cache,
+        krv_cache,
+        bridge,
+        query,
+        force_output,
+        enable_query,
+        kInferForcedLoops,
+        use_parallel_retention,
+        kInferWriteMemory);
+    (void)step;
+    current = token_id;
+  }
+
+  std::vector<size_t> generated_ids;
+  generated_ids.reserve(tokens);
+  for (size_t i = 0; i < tokens; ++i) {
+    const std::string generated_so_far = tokenizer.decode(generated_ids);
+    const ChatTextState state = parse_chat_text_state(generated_so_far);
+    if (state.assistant_closed) {
+      break;
+    }
+
+    const auto step = model.step_with_trace(
+        current,
+        recurrent_state,
+        chrono_kv_cache,
+        krv_cache,
+        bridge,
+        query,
+        force_output,
+        enable_query,
+        kInferForcedLoops,
+        use_parallel_retention,
+        kInferWriteMemory);
+
+    const float progress = static_cast<float>(i + 1)
+        / static_cast<float>(std::max<size_t>(1, tokens));
+    const float assistant_progress_bias = std::max(0.0f, assistant_close_bias_max) * progress;
+    current = sample_with_bias(
+        step.logits,
+        generated_ids,
+        state.in_think,
+        assistant_progress_bias);
+    generated_ids.push_back(current);
+  }
+
+  const std::string generated_raw = tokenizer.decode(generated_ids);
+  const ChatTextState final_state = parse_chat_text_state(generated_raw);
+  const std::string cleaned = strip_spaces_before_punct(final_state.visible_text);
+
+  std::cout << "Prompt: " << prompt << "\n";
+  std::cout << "Completion: " << cleaned << "\n";
+  return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1866,6 +2175,10 @@ int main(int argc, char** argv) {
     if (cmd == "infer") {
       const ParsedArgs args = parse_args(argc, argv, 2);
       return run_infer_command(args);
+    }
+    if (cmd == "chat") {
+      const ParsedArgs args = parse_args(argc, argv, 2);
+      return run_chat_command(args);
     }
     if (cmd == "help" || cmd == "--help" || cmd == "-h") {
       print_usage(argv[0]);
