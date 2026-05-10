@@ -1404,7 +1404,7 @@ void print_usage(const char* program) {
       << "  -i, --input PATH              Model binary\n"
       << "  -tok, --tokenizer PATH        Tokenizer vocab CSV (token,score)\n"
       << "  -m, --memory_module PATH      Load memory module graph path\n"
-      << "  -p, --prompt TEXT             User prompt text (default: empty)\n"
+      << "  -p, --prompt TEXT             Optional initial user message before stdin chat loop\n"
       << "  -t, --tokens N                Maximum generated tokens (default: 256)\n"
       << "  --enable-query BOOL           Allow QUERY_MEMORY action during inference\n"
       << "  --force-output BOOL           Force OUTPUT action each step\n"
@@ -1946,7 +1946,7 @@ int run_chat_command(const ParsedArgs& args) {
     throw std::runtime_error("chat requires -tok/--tokenizer");
   }
   const Tokenizer tokenizer(tokenizer_path);
-  const std::string prompt = get_flag(args, "prompt", "p");
+  const std::string initial_prompt = get_flag(args, "prompt", "p");
   const size_t tokens = has_flag(args, "tokens", "t")
       ? parse_size(get_flag(args, "tokens", "t"), "tokens")
       : 256;
@@ -2081,75 +2081,94 @@ int run_chat_command(const ParsedArgs& args) {
   llm::arch::AttentionMemory chrono_kv_cache;
   llm::arch::AttentionMemory krv_cache;
 
-  const std::string formatted_prompt = build_chat_prompt_text(prompt);
-  std::vector<size_t> prompt_ids;
-  {
-    const auto prompt_tokens = tokenizer.tokenize(formatted_prompt);
-    prompt_ids.reserve(prompt_tokens.size());
-    for (const auto& t : prompt_tokens) {
-      prompt_ids.push_back(t.id);
-    }
-  }
-
-  size_t current = prompt_ids.empty() ? 0 : prompt_ids.back();
+  size_t current = 0;
   constexpr size_t kInferForcedLoops = 1;
   constexpr bool kInferWriteMemory = false;
-  for (size_t token_id : prompt_ids) {
-    const auto step = model.step_with_trace(
-        token_id,
-        recurrent_state,
-        chrono_kv_cache,
-        krv_cache,
-        bridge,
-        query,
-        force_output,
-        enable_query,
-        kInferForcedLoops,
-        use_parallel_retention,
-        kInferWriteMemory);
-    (void)step;
-    current = token_id;
-  }
+  auto process_ids = [&](const std::vector<size_t>& ids) {
+    for (size_t token_id : ids) {
+      const auto step = model.step_with_trace(
+          token_id,
+          recurrent_state,
+          chrono_kv_cache,
+          krv_cache,
+          bridge,
+          query,
+          force_output,
+          enable_query,
+          kInferForcedLoops,
+          use_parallel_retention,
+          kInferWriteMemory);
+      (void)step;
+      current = token_id;
+    }
+  };
 
-  std::vector<size_t> generated_ids;
-  generated_ids.reserve(tokens);
-  for (size_t i = 0; i < tokens; ++i) {
-    const std::string generated_so_far = tokenizer.decode(generated_ids);
-    const ChatTextState state = parse_chat_text_state(generated_so_far);
-    if (state.assistant_closed) {
-      break;
+  auto run_assistant_turn = [&](const std::string& user_text) {
+    const std::string formatted_prompt = build_chat_prompt_text(user_text);
+    const std::vector<size_t> prompt_ids = tokenize_ids(formatted_prompt, tokenizer);
+    process_ids(prompt_ids);
+
+    std::vector<size_t> generated_ids;
+    generated_ids.reserve(tokens);
+    for (size_t i = 0; i < tokens; ++i) {
+      const std::string generated_so_far = tokenizer.decode(generated_ids);
+      const ChatTextState state = parse_chat_text_state(generated_so_far);
+      if (state.assistant_closed) {
+        break;
+      }
+
+      const auto step = model.step_with_trace(
+          current,
+          recurrent_state,
+          chrono_kv_cache,
+          krv_cache,
+          bridge,
+          query,
+          force_output,
+          enable_query,
+          kInferForcedLoops,
+          use_parallel_retention,
+          kInferWriteMemory);
+
+      const float progress = static_cast<float>(i + 1)
+          / static_cast<float>(std::max<size_t>(1, tokens));
+      const float assistant_progress_bias = std::max(0.0f, assistant_close_bias_max) * progress;
+      current = sample_with_bias(
+          step.logits,
+          generated_ids,
+          state.in_think,
+          assistant_progress_bias);
+      generated_ids.push_back(current);
     }
 
-    const auto step = model.step_with_trace(
-        current,
-        recurrent_state,
-        chrono_kv_cache,
-        krv_cache,
-        bridge,
-        query,
-        force_output,
-        enable_query,
-        kInferForcedLoops,
-        use_parallel_retention,
-        kInferWriteMemory);
+    const std::string generated_raw = tokenizer.decode(generated_ids);
+    const ChatTextState final_state = parse_chat_text_state(generated_raw);
+    const std::string cleaned = strip_spaces_before_punct(final_state.visible_text);
+    std::cout << "Assistant: " << cleaned << "\n";
+  };
 
-    const float progress = static_cast<float>(i + 1)
-        / static_cast<float>(std::max<size_t>(1, tokens));
-    const float assistant_progress_bias = std::max(0.0f, assistant_close_bias_max) * progress;
-    current = sample_with_bias(
-        step.logits,
-        generated_ids,
-        state.in_think,
-        assistant_progress_bias);
-    generated_ids.push_back(current);
+  std::cout << "Chat mode. Enter message, Ctrl-D or /exit to quit.\n";
+  if (!initial_prompt.empty()) {
+    std::cout << "User: " << initial_prompt << "\n";
+    run_assistant_turn(initial_prompt);
   }
 
-  const std::string generated_raw = tokenizer.decode(generated_ids);
-  const ChatTextState final_state = parse_chat_text_state(generated_raw);
-  const std::string cleaned = strip_spaces_before_punct(final_state.visible_text);
+  while (true) {
+    std::cout << "User: ";
+    std::string user_text;
+    if (!std::getline(std::cin, user_text)) {
+      std::cout << "\n";
+      break;
+    }
+    if (user_text == "/exit") {
+      break;
+    }
+    if (user_text.empty()) {
+      continue;
+    }
+    run_assistant_turn(user_text);
+  }
 
-  std::cout << "Prompt: " << prompt << "\n";
-  std::cout << "Completion: " << cleaned << "\n";
   return 0;
 }
 
