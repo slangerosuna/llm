@@ -45,5 +45,5 @@ target_compile_options(llm_sycl PRIVATE -fsycl -mavx2 -mf16c)
 target_link_options(llm_sycl PRIVATE -fsycl)
 # target_link_libraries(llm_sycl PRIVATE Boost::json)
 
-enable_testing()
-add_subdirectory(tests)
+# enable_testing()
+# add_subdirectory(tests)

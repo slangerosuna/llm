@@ -3,6 +3,8 @@
 build
 build-asan
 build-container
+datasets
+models
 *.o
 *.obj
 *.a
